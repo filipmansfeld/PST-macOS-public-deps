@@ -1,6 +1,6 @@
 # Official-44 public Mac dependency cache
 
-Revision 2 is prepared locally. It preserves the official source and public notice contract; publishing this revision is an explicit repository-owner action.
+The recipe is versioned with its workflow and exact public notice contract. Publication is an explicit repository-owner action.
 
 This repository is `filipmansfeld/PST-macOS-public-deps`. It contains
 only this README, the generic exporter, the exact public ct2rs MIT notice and its
@@ -34,7 +34,16 @@ external fingerprint directories may be retained. Fingerprint ownership uses
 the exact reviewed Cargo-version package-name layout, never output-hash guesses;
 names colliding with an excluded package fail closed. Complete fetched external
 package sources and actual license/notice texts are included. Unknown packages,
-unsupported layout, missing licenses, links and escaped paths fail the export.
+unsupported layout, missing licenses and escaped source paths fail the export.
+Corresponding-source, fingerprint and library traversal rejects links. Native
+build-output links are handled only within the same exact output owner: safe
+inside links become verified ordinary copies at their original logical paths.
+Outside, cyclic or unrepresentable empty-directory links are omitted and recorded;
+that package's library/build-tool artifacts and fingerprints are excluded from
+Cargo-ready material. Its remaining safe native files are inspection-only under
+`inspection-native-output/`, never a Cargo import. The receipt explicitly reports
+incomplete package IDs and normal rebuild requirements; it claims no complete
+standalone reusable native closure.
 
 The reviewed source-license contract pins the official Cargo.lock and the exact
 public ct2rs/CTranslate2/Ruy/cpuinfo notice texts. The actual export still requires

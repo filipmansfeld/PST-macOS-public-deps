@@ -145,6 +145,210 @@ class Exporter:
         for path in files(directory):
             self.copy(path, category, owner, base)
 
+    def native_output_plan(self, directory, owner):
+        """Inspect only one exact external build output owner; never broaden it."""
+        need(directory.resolve(strict=True) == directory and self.target in directory.parents,
+             "Native output owner must be a canonical exact subtree of the fresh target.")
+        plan = {"package_id": owner, "output_parent": str(directory), "files": [], "directories": [], "links": [], "omitted_links": []}
+        directory_snapshots = {}
+        entries = 0
+        expanded_bytes = 0
+        def identity(path):
+            value = path.lstat()
+            return {key: getattr(value, key) for key in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")}
+        def directory_members(path):
+            return [{"name": child.name, "file_type": stat.S_IFMT(child.lstat().st_mode),
+                     "identity": identity(child)} for child in sorted(path.iterdir())]
+        def inside(path):
+            return path == directory or directory in path.parents
+        def resolve_owned(path):
+            # Inspect every link hop inside this owner before following it. A
+            # link may not escape and then re-enter via another outside link.
+            pending = list(path.relative_to(directory).parts)
+            current = directory
+            hops = []
+            seen = set()
+            while pending:
+                component = pending.pop(0)
+                if component == "..":
+                    current = current.parent
+                    if not inside(current):
+                        return None, hops, "outside_owner_parent_component", str(current)
+                    continue
+                if component == ".":
+                    if not current.is_dir():
+                        return None, hops, "non_directory_component", str(current)
+                    continue
+                current = current / component
+                try:
+                    value = current.lstat()
+                except OSError:
+                    return None, hops, "unresolved_target", str(current)
+                if stat.S_ISLNK(value.st_mode):
+                    raw = os.readlink(current)
+                    # Preserve '..' until earlier link components are actually
+                    # resolved; collapsing them first changes symlink semantics.
+                    lexical = Path(raw) if Path(raw).is_absolute() else current.parent / raw
+                    hop = {"path": str(current), "original_target": raw, "lexical_target": str(lexical), "identity": identity(current)}
+                    hops.append(hop)
+                    if not inside(lexical):
+                        return None, hops, "outside_owner_link_hop", str(lexical)
+                    state = (current, tuple(pending))
+                    if state in seen or len(hops) > 64:
+                        return None, hops, "link_chain_cycle_or_limit", str(lexical)
+                    seen.add(state)
+                    target_parts = list(lexical.relative_to(directory).parts)
+                    if raw.endswith("/") or raw.endswith("/.") or raw == ".":
+                        target_parts.append(".")
+                    pending = target_parts + pending
+                    current = directory
+                elif pending and not stat.S_ISDIR(value.st_mode):
+                    return None, hops, "non_directory_component", str(current)
+            return current, hops, None, str(current)
+        def walk(logical, actual, ancestors, refs, depth):
+            nonlocal entries, expanded_bytes
+            entries += 1
+            need(entries <= 100000 and depth <= 64, "Native alias expansion exceeds its bounded entry/depth gate.")
+            value = actual.lstat()
+            if stat.S_ISLNK(value.st_mode):
+                need(len(plan["links"]) < 1024, "Native link diagnostic inventory exceeds its bounded gate.")
+                resolved, hops, reason, target = resolve_owned(actual)
+                event = {"source_link_path": str(actual), "logical_link_path": str(logical),
+                         "original_target": os.readlink(actual), "resolved_target": str(resolved) if resolved else None,
+                         "diagnostic_target": target, "hops": hops, "target_type": None,
+                         "omitted_reason": reason, "target_content_read": False}
+                index = len(plan["links"])
+                plan["links"].append(event)
+                if reason:
+                    plan["omitted_links"].append(event)
+                    return
+                if ".git" in resolved.relative_to(directory).parts:
+                    event["omitted_reason"] = "git_control_target"
+                    plan["omitted_links"].append(event)
+                    return
+                need(inside(resolved) and resolved.resolve(strict=True) == resolved,
+                     "Resolved native link target is not inside the same canonical owner.")
+                target_stat = resolved.lstat()
+                if stat.S_ISDIR(target_stat.st_mode) and (target_stat.st_dev, target_stat.st_ino) in ancestors:
+                    event["target_type"] = "directory"
+                    event["omitted_reason"] = "directory_cycle_or_ancestor"
+                    plan["omitted_links"].append(event)
+                    return
+                event["target_type"] = "directory" if stat.S_ISDIR(target_stat.st_mode) else "regular_file" if stat.S_ISREG(target_stat.st_mode) else "special"
+                if event["target_type"] == "special":
+                    event["omitted_reason"] = "special_link_target"
+                    plan["omitted_links"].append(event)
+                    return
+                walk(logical, resolved, ancestors, refs + [index], depth + 1)
+                event["target_content_read"] = True
+                return
+            need(actual.resolve(strict=True) == actual and inside(actual), "Native physical source escaped its exact owner.")
+            if stat.S_ISDIR(value.st_mode):
+                key = (value.st_dev, value.st_ino)
+                need(key not in ancestors, "Unexpected native directory cycle.")
+                snapshot = {"path": str(actual), "identity": identity(actual), "members": directory_members(actual)}
+                if str(actual) in directory_snapshots:
+                    need(directory_snapshots[str(actual)] == snapshot, "Native alias source directory changed between scans.")
+                else:
+                    directory_snapshots[str(actual)] = snapshot
+                for child in sorted(actual.iterdir()):
+                    if child.name == ".git":
+                        continue
+                    walk(logical / child.name, child, ancestors | {key}, refs, depth + 1)
+                need(identity(actual) == snapshot["identity"] and directory_members(actual) == snapshot["members"],
+                     "Native source directory membership changed during inventory.")
+            else:
+                need(stat.S_ISREG(value.st_mode), "Refuse a special native output file.")
+                actual_pin = pin(actual)
+                expanded_bytes += actual_pin["bytes"]
+                need(expanded_bytes <= 4 * 1024 * 1024 * 1024, "Native alias expansion exceeds its bounded byte gate.")
+                plan["files"].append({"logical_path": str(logical), "physical_source": str(actual),
+                                      "source_pin": actual_pin, "followed_link_indexes": refs})
+        walk(directory, directory, set(), [], 0)
+        plan["directories"] = list(directory_snapshots.values())
+        plan["native_directory_count"] = len(plan["directories"])
+        plan["directory_membership_sha256"] = hashlib.sha256(json.dumps(plan["directories"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        for index, event in enumerate(plan["links"]):
+            if event["omitted_reason"]:
+                continue
+            leaves = [{"logical_relative_path": Path(item["logical_path"]).relative_to(Path(event["logical_link_path"])).as_posix(),
+                       "bytes": item["source_pin"]["bytes"], "sha256": item["source_pin"]["sha256"]}
+                      for item in plan["files"] if index in item["followed_link_indexes"]]
+            if event["target_type"] == "directory" and not leaves:
+                # The file-only archive cannot represent an empty directory
+                # alias; do not label that missing logical alias cache-ready.
+                event["omitted_reason"] = "empty_directory_link_not_materialized"
+                plan["omitted_links"].append(event)
+            event["copied_target_content_scope"] = "selected_safe_regular_descendants_only"
+            event["copied_target_file_count"] = len(leaves)
+            event["copied_target_bytes"] = sum(item["bytes"] for item in leaves)
+            event["copied_target_content_sha256"] = hashlib.sha256(json.dumps(leaves, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if event["target_type"] == "regular_file":
+                need(len(leaves) == 1, "A native regular-file link must bind one exact content pin.")
+                event["resolved_target_pin"] = {key: leaves[0][key] for key in ("bytes", "sha256")}
+        plan["cache_complete"] = not plan["omitted_links"]
+        plan["native_regular_file_count"] = len(plan["files"])
+        if plan["links"]:
+            print(json.dumps({"phase": "native-output-scan", "package_id": owner, "output_parent": str(directory),
+                              "cache_complete": plan["cache_complete"], "link_count": len(plan["links"]),
+                              "omitted_link_count": len(plan["omitted_links"]),
+                              "first_links": [{key: event[key] for key in ("source_link_path", "logical_link_path", "original_target",
+                                                "resolved_target", "diagnostic_target", "target_type", "omitted_reason")}
+                                              for event in plan["links"][:16]]}, sort_keys=True), flush=True)
+        return plan
+
+    def copy_native_output_plan(self, plan, category):
+        owner_root = Path(plan["output_parent"])
+        owner = plan["package_id"]
+        need(category in {"target", "inspection-native-output"}, "Unknown native export category.")
+        def verify_directories():
+            for snapshot in plan["directories"]:
+                directory = Path(snapshot["path"])
+                need((directory == owner_root or owner_root in directory.parents) and directory.resolve(strict=True) == directory,
+                     "Native source directory escaped its exact owner after inventory.")
+                value = directory.lstat()
+                members = [{"name": child.name, "file_type": stat.S_IFMT(child.lstat().st_mode),
+                            "identity": {key: getattr(child.lstat(), key) for key in snapshot["identity"]}}
+                           for child in sorted(directory.iterdir())]
+                need({key: getattr(value, key) for key in snapshot["identity"]} == snapshot["identity"] and members == snapshot["members"],
+                     "Native source directory identity/membership changed after inventory.")
+        verify_directories()
+        for event in plan["links"]:
+            for hop in event["hops"]:
+                path = Path(hop["path"])
+                value = path.lstat()
+                need({key: getattr(value, key) for key in hop["identity"]} == hop["identity"]
+                     and os.readlink(path) == hop["original_target"], "Native source link changed after inventory.")
+        for item in plan["files"]:
+            logical = Path(item["logical_path"])
+            actual = Path(item["physical_source"])
+            need(owner_root in logical.parents and owner_root in actual.parents
+                 and actual.resolve(strict=True) == actual and pin(actual) == item["source_pin"],
+                 "Native derivative source changed or escaped its exact owner.")
+            destination = self.staging / category / logical.relative_to(self.target)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                need(pin(destination)["sha256"] == item["source_pin"]["sha256"], "Conflicting native derivative bytes.")
+            else:
+                shutil.copy2(actual, destination)
+            copied = pin(destination)
+            need(copied == item["source_pin"] and pin(actual) == item["source_pin"],
+                 "Native ordinary derivative is not an unchanged byte/mtime copy.")
+            key = destination.relative_to(self.staging).as_posix()
+            row = self.inventory.setdefault(key, {"path": key, **copied, "owners": []})
+            if owner not in row["owners"]:
+                row["owners"].append(owner)
+            row.setdefault("native_output_derivatives", []).append({"owner_output_parent": str(owner_root),
+                       "physical_source": str(actual), "followed_link_indexes": item["followed_link_indexes"],
+                       "ordinary_copy": True, "cache_import_eligible": category == "target"})
+        for event in plan["links"]:
+            for hop in event["hops"]:
+                path = Path(hop["path"])
+                value = path.lstat()
+                need({key: getattr(value, key) for key in hop["identity"]} == hop["identity"]
+                     and os.readlink(path) == hop["original_target"], "Native source link changed during its derivative copies.")
+        verify_directories()
+
     def build(self):
         need(self.text("official-commit", ["git", "rev-parse", "HEAD"]) == OFFICIAL_COMMIT, "Official source commit mismatch.")
         need(self.text("official-tree", ["git", "rev-parse", "HEAD^{tree}"]) == OFFICIAL_TREE, "Official source tree mismatch.")
@@ -189,8 +393,25 @@ class Exporter:
                                                   "--target", self.args.target, "--message-format=json-render-diagnostics"])
         messages = [json.loads(line) for line in raw.read_text().splitlines() if line.startswith("{")]
         need(any(item.get("reason") == "build-finished" and item.get("success") is True for item in messages), "Natural build completion missing.")
+        native_plans = {}
+        incomplete = set()
+        for message in messages:
+            if message.get("reason") != "build-script-executed" or message["package_id"] not in allowed:
+                continue
+            package_id = message["package_id"]
+            package = allowed[package_id]
+            output = Path(message["out_dir"])
+            need(self.target in output.parents and output.name == "out"
+                 and re.fullmatch(re.escape(package["name"]) + r"-[0-9a-f]{16}", output.parent.name), "Unproven external build OUT_DIR.")
+            key = (package_id, str(output.parent))
+            if key not in native_plans:
+                native_plans[key] = self.native_output_plan(output.parent, package_id)
+            if not native_plans[key]["cache_complete"]:
+                incomplete.add(package_id)
         compiled = set()
         excluded = []
+        omitted_artifacts = []
+        omitted_fingerprints = []
         for message in messages:
             if message.get("reason") not in {"compiler-artifact", "build-script-executed"}:
                 continue
@@ -202,10 +423,10 @@ class Exporter:
             compiled.add(package_id)
             package = allowed[package_id]
             if message["reason"] == "build-script-executed":
-                output = Path(message["out_dir"])
-                need(self.target in output.parents and output.name == "out"
-                     and re.fullmatch(re.escape(package["name"]) + r"-[0-9a-f]{16}", output.parent.name), "Unproven external build OUT_DIR.")
-                self.tree(output.parent, "target", package_id, self.target)
+                continue
+            if package_id in incomplete:
+                omitted_artifacts.append({"package_id": package_id, "filenames": message["filenames"],
+                                          "reason": "native_owner_cache_incomplete_normal_rebuild_required"})
                 continue
             kind = set(message["target"]["kind"])
             need(message["profile"].get("test") is False and not kind.intersection({"bin", "example", "test", "bench"}), "Do not export executable/test workspace products.")
@@ -215,7 +436,8 @@ class Exporter:
                 need(self.target in path.parents, "Compiler output escaped the fresh target.")
                 if "custom-build" in kind:
                     need(path.parent.parent.name == "build" and re.fullmatch(re.escape(package["name"]) + r"-[0-9a-f]{16}", path.parent.name), "Unknown dependency build-tool directory.")
-                    self.tree(path.parent, "target", package_id, self.target)
+                    if (package_id, str(path.parent)) not in native_plans:
+                        self.tree(path.parent, "target", package_id, self.target)
                 else:
                     need(path.parent.name == "deps", "External library must be an exact reported deps leaf.")
                     self.copy(path, "target", package_id, self.target)
@@ -227,6 +449,12 @@ class Exporter:
                                           path.parent / ("lib" + message["target"]["name"] + "-" + match[1] + ".rmeta")):
                             if companion.exists():
                                 self.copy(companion, "target", package_id, self.target)
+        native_owners = []
+        for plan in native_plans.values():
+            plan["cache_complete"] = plan["package_id"] not in incomplete
+            plan["export_category"] = "target" if plan["cache_complete"] else "inspection-native-output"
+            self.copy_native_output_plan(plan, plan["export_category"])
+            native_owners.append({key: value for key, value in plan.items() if key not in {"files", "directories"}})
         need(compiled, "Expected real external Rust dependency closure missing.")
         if self.args.architecture == "arm64":
             need(any(allowed[key]["name"] == "ct2rs" for key in compiled), "Expected real ARM ct2rs dependency closure missing.")
@@ -243,10 +471,15 @@ class Exporter:
                     continue
                 candidates = by_name[match[1]]
                 need(all(key in allowed for key in candidates), "Fingerprint name collides with an excluded workspace/path package.")
+                if any(key in incomplete for key in candidates):
+                    omitted_fingerprints.append({"path": str(directory), "external_package_candidates": candidates,
+                                                 "reason": "native_owner_cache_incomplete_normal_rebuild_required"})
+                    continue
                 self.tree(directory, "target", {"external_package_candidates": candidates, "ownership": "verified Cargo-version exact package-name directory"}, self.target)
         source_rows = []
         native_builds = [{"package_id": item["package_id"], "out_dir": item["out_dir"],
-                          "linked_libs": item.get("linked_libs", []), "linked_paths": item.get("linked_paths", [])}
+                          "linked_libs": item.get("linked_libs", []), "linked_paths": item.get("linked_paths", []),
+                          "cache_import_eligible": item["package_id"] not in incomplete}
                          for item in messages if item.get("reason") == "build-script-executed" and item["package_id"] in compiled]
         for package_id in sorted(compiled):
             package = allowed[package_id]
@@ -310,6 +543,12 @@ class Exporter:
                    "consumer_must_not_rewrite_fingerprints_or_force_workspace_freshness": True,
                    "license_inventory": license_inventory, "license_inventory_sha256": license_sha,
                    "source_license_contract_sha256": contract_pin["sha256"], "actual_external_native_builds": native_builds,
+                   "native_cache_complete": not incomplete, "native_cache_incomplete_package_ids": sorted(incomplete),
+                   "native_output_owners": native_owners, "non_cache_inspection_prefix": "inspection-native-output/",
+                   "incomplete_package_target_artifacts_omitted": omitted_artifacts,
+                   "incomplete_package_fingerprints_omitted": omitted_fingerprints,
+                   "seed_scope": "partial_external_dependency_material_normal_Cargo_freshness_rules_apply",
+                   "notice_verification_scope": "actual_exported_sources_and_notice_texts_not_omitted_links_or_cache_completeness",
                    "automatic_source_and_native_notice_inventory_verified": True,
                    "source_license_contract_approved_for_publication": self.args.publish_requested == "true"}
         save(self.staging / "provenance.json", receipt)
@@ -330,6 +569,10 @@ class Exporter:
                    "runtime_verified": False, "license_inventory_sha256": license_sha,
                    "license_inventory": license_inventory,
                    "source_license_contract_sha256": contract_pin["sha256"],
+                   "native_cache_complete": not incomplete, "native_cache_incomplete_package_ids": sorted(incomplete),
+                   "native_output_owners": native_owners, "non_cache_inspection_prefix": "inspection-native-output/",
+                   "seed_scope": "partial_external_dependency_material_normal_Cargo_freshness_rules_apply",
+                   "notice_verification_scope": "actual_exported_sources_and_notice_texts_not_omitted_links_or_cache_completeness",
                    "automatic_source_and_native_notice_inventory_verified": True,
                    "source_license_contract_approved_for_publication": self.args.publish_requested == "true"}
         save(delivery / ("deps-" + self.args.architecture + ".provenance.json"), summary)
