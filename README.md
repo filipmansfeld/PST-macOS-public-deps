@@ -105,3 +105,27 @@ external-dependency release assets after the source-license inventory gate.
 Supply `publish_release_assets=true`, the exact reviewed source-license contract
 SHA256, and the actual pre-created release tag/ID. The release must target the
 same recipe commit as the dispatched workflow (`GITHUB_SHA`).
+
+
+R6 original licence preflight and partial-seed policy
+
+Before Cargo compilation, target-filtered metadata enumerates the conservative non-dev omsi-app dependency closure. Missing original texts are resolved only from the actual authored repository (or authored homepage when repository is absent), reported exact clean VCS commit, and an original Cargo.toml bound by raw byte identity or the exact CRLF-to-LF transform recorded below. GitHub metadata redirects stay on api.github.com and the final repository must be public. GitLab reads are public unauthenticated exact-commit tree/blob GETs; GitHub authorization is never forwarded. Missing path_in_vcs requires one unique matching authored-manifest Git blob in the complete original tree. Tree-URL suffixes are locator metadata, never branch-build inputs.
+
+Actual standardized CC0 terms are included only when the verified original authored package and Cargo metadata both declare CC0-1.0. The staged SPDX text is 7,048 bytes/SHA256 a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499, from spdx/license-list-data commit 31ba1a50e5397e00a304dbadc76531740e89ee48, tree dc9f030bcb3744a0a351fad8eafb94015f4305fa, blob 0e259d42c996742e9e3cba14c677129b2c1b6311. It is explicitly standardized terms under the original declaration, not a claimed author-repository licence file. CT2 original and vendor notice contract is unchanged.
+
+Unresolved packages are named before compilation and omitted from public export, together with every actual compiled non-dev transitive dependent. No corresponding source, native output, inspection files, target library/build executable, or fingerprint owned by an omitted package is exported. Ambiguous fingerprint candidates also require actual compilation and resolved licensing. The provenance fields unresolved_license_packages and license_omitted_actual_compiled_package_ids identify omissions; license_omission_policy requires normal private Cargo rebuilds. This is a partial dependency seed, not evidence that every dependency can be reused.
+
+Native generated aliases may transition directly only to the actual compiled and licence-resolved ct2rs package root or cxx include/cxx.h. All physical package roots come from exact Cargo metadata manifest_path parents. Workspace, unknown, ambiguous nested owners and package-source symlinks remain refused. Original output logical paths remain unchanged; separate physical_source_owner records bind source owner/package root/selection/licence-info digest. Derivative inventory binds the identical included cargo-home corresponding-source path. Every directory membership/link identity and copied content is checked again. If any other alias remains unresolved, the native owner stays incomplete/data-only and its ready cache files/fingerprints are omitted.
+
+
+Registry archive custody
+
+Each exported licensed actual compiled registry owner includes exactly its corresponding cargo-home/registry/cache/<same source index>/<name>-<version>.crate. Original archive SHA256 must equal the exact reviewed official Cargo.lock checksum for the package name/version/source tuple. Package and licence inventory records expose registry_archive with its included path, actual pin, lock identity and checksum confirmation. No unrelated registry archives, global-cache database, Cargo settings, credentials, or workspace source are copied. Consumers validate the archive against their actual lock and may derive checksum/source integrity without assuming a legacy .cargo-checksum.json exists.
+
+Metadata redirects may retain only the exact worker-generated observed nonce query. It is checked and removed before the next GET; that GET creates a fresh nonce. Other query keys/duplicate values, credentials, changed provider and non-metadata routes are refused.
+
+
+Authored manifests may differ from the exact original Git blob only by the explicitly verified CRLF-to-LF byte transform. Both original Git blob/SHA256/bytes and unchanged archive authored-manifest SHA remain recorded; original_manifest_byte_identical stays false when raw bytes differ, with exact_crlf_to_lf_equal true. No general TOML, whitespace, name, version or licence relaxation applies. Explicit workspace-inherited repository/homepage declarations must resolve to an actual scalar from the closest original exact-commit workspace.package manifest and equal normalized Cargo metadata.
+
+
+Matched original notice directories are read as bounded exact-commit ordinary trees, with at most 1,024 selected regular UTF-8 text descendants, depth32 and8MiB aggregate. Links, gitlinks and special entries remain refused; directory-scoped notice records identify the actual parent. Workspace inheritance selects one actual owning workspace from explicit package.workspace or the closest [workspace] boundary. Repository/homepage, version and licence all resolve from that same root; a missing field is unresolved rather than borrowed from a farther workspace.

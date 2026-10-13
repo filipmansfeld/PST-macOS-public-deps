@@ -163,6 +163,21 @@ class Exporter:
                      "identity": identity(child)} for child in sorted(path.iterdir())]
         def inside(path):
             return path == directory or directory in path.parents
+        def public_source_owner(path):
+            matches = [value for value in getattr(self, "native_public_source_owners", [])
+                       if path == Path(value["selected_path"]) or value["allow_descendants"] and Path(value["selected_path"]) in path.parents]
+            if len(matches) != 1:
+                return None
+            selected = matches[0]
+            roots = [value for value in getattr(self, "native_all_package_roots", [])
+                     if path == Path(value["source_root"]) or Path(value["source_root"]) in path.parents]
+            if not roots:
+                return None
+            deepest = max(len(Path(value["source_root"]).parts) for value in roots)
+            exact = [value for value in roots if len(Path(value["source_root"]).parts) == deepest]
+            return selected if len(exact) == 1 and exact[0]["package_id"] == selected["package_id"] else None
+        def physical_owned(path):
+            return inside(path) or public_source_owner(path) is not None
         def resolve_owned(path):
             # Inspect every link hop inside this owner before following it. A
             # link may not escape and then re-enter via another outside link.
@@ -194,7 +209,23 @@ class Exporter:
                     hop = {"path": str(current), "original_target": raw, "lexical_target": str(lexical), "identity": identity(current)}
                     hops.append(hop)
                     if not inside(lexical):
-                        return None, hops, "outside_owner_link_hop", str(lexical)
+                        # One direct transition to a reviewed public package path;
+                        # package source itself remains strict no-links throughout.
+                        candidate = lexical.joinpath(*pending)
+                        source_owner = public_source_owner(candidate)
+                        if source_owner is None:
+                            return None, hops, "outside_owner_unlicensed_or_unknown_public_source", str(candidate)
+                        try:
+                            resolved_candidate = candidate.resolve(strict=True)
+                            candidate_stat = candidate.lstat()
+                        except (OSError, RuntimeError):
+                            return None, hops, "unresolved_public_source_target", str(candidate)
+                        if ".." in candidate.parts or resolved_candidate != candidate:
+                            return None, hops, "noncanonical_or_linked_public_source_target", str(candidate)
+                        if not pending and (raw.endswith("/") or raw.endswith("/.") or raw == ".") and not stat.S_ISDIR(candidate_stat.st_mode):
+                            return None, hops, "non_directory_public_source_component", str(candidate)
+                        hop["public_source_owner"] = source_owner
+                        return candidate, hops, None, str(candidate)
                     state = (current, tuple(pending))
                     if state in seen or len(hops) > 64:
                         return None, hops, "link_chain_cycle_or_limit", str(lexical)
@@ -213,6 +244,7 @@ class Exporter:
             need(entries <= 100000 and depth <= 64, "Native alias expansion exceeds its bounded entry/depth gate.")
             value = actual.lstat()
             if stat.S_ISLNK(value.st_mode):
+                need(inside(actual), "Public package source traversal must not follow source-side links.")
                 need(len(plan["links"]) < 1024, "Native link diagnostic inventory exceeds its bounded gate.")
                 resolved, hops, reason, target = resolve_owned(actual)
                 event = {"source_link_path": str(actual), "logical_link_path": str(logical),
@@ -224,12 +256,14 @@ class Exporter:
                 if reason:
                     plan["omitted_links"].append(event)
                     return
-                if ".git" in resolved.relative_to(directory).parts:
+                physical_root = directory if inside(resolved) else Path(public_source_owner(resolved)["source_root"])
+                if ".git" in resolved.relative_to(physical_root).parts:
                     event["omitted_reason"] = "git_control_target"
                     plan["omitted_links"].append(event)
                     return
-                need(inside(resolved) and resolved.resolve(strict=True) == resolved,
-                     "Resolved native link target is not inside the same canonical owner.")
+                need(physical_owned(resolved) and resolved.resolve(strict=True) == resolved,
+                     "Resolved native target escaped its exact output or licensed public package owner.")
+                event["physical_source_owner"] = public_source_owner(resolved)
                 target_stat = resolved.lstat()
                 if stat.S_ISDIR(target_stat.st_mode) and (target_stat.st_dev, target_stat.st_ino) in ancestors:
                     event["target_type"] = "directory"
@@ -244,11 +278,12 @@ class Exporter:
                 walk(logical, resolved, ancestors, refs + [index], depth + 1)
                 event["target_content_read"] = True
                 return
-            need(actual.resolve(strict=True) == actual and inside(actual), "Native physical source escaped its exact owner.")
+            need(actual.resolve(strict=True) == actual and physical_owned(actual), "Native physical source escaped its exact verified owner.")
             if stat.S_ISDIR(value.st_mode):
                 key = (value.st_dev, value.st_ino)
                 need(key not in ancestors, "Unexpected native directory cycle.")
-                snapshot = {"path": str(actual), "identity": identity(actual), "members": directory_members(actual)}
+                snapshot = {"path": str(actual), "identity": identity(actual), "members": directory_members(actual),
+                            "physical_source_owner": public_source_owner(actual)}
                 if str(actual) in directory_snapshots:
                     need(directory_snapshots[str(actual)] == snapshot, "Native alias source directory changed between scans.")
                 else:
@@ -265,7 +300,8 @@ class Exporter:
                 expanded_bytes += actual_pin["bytes"]
                 need(expanded_bytes <= 4 * 1024 * 1024 * 1024, "Native alias expansion exceeds its bounded byte gate.")
                 plan["files"].append({"logical_path": str(logical), "physical_source": str(actual),
-                                      "source_pin": actual_pin, "followed_link_indexes": refs})
+                                      "source_pin": actual_pin, "followed_link_indexes": refs,
+                                      "physical_source_owner": public_source_owner(actual)})
         walk(directory, directory, set(), [], 0)
         plan["directories"] = list(directory_snapshots.values())
         plan["native_directory_count"] = len(plan["directories"])
@@ -303,10 +339,16 @@ class Exporter:
         owner_root = Path(plan["output_parent"])
         owner = plan["package_id"]
         need(category in {"target", "inspection-native-output"}, "Unknown native export category.")
+        def physical_owned(path, source_owner):
+            if source_owner is None:
+                return path == owner_root or owner_root in path.parents
+            need(source_owner in getattr(self, "native_public_source_owners", []), "Native public source owner proof changed.")
+            selected = Path(source_owner["selected_path"])
+            return path == selected or source_owner["allow_descendants"] and selected in path.parents
         def verify_directories():
             for snapshot in plan["directories"]:
                 directory = Path(snapshot["path"])
-                need((directory == owner_root or owner_root in directory.parents) and directory.resolve(strict=True) == directory,
+                need(physical_owned(directory, snapshot["physical_source_owner"]) and directory.resolve(strict=True) == directory,
                      "Native source directory escaped its exact owner after inventory.")
                 value = directory.lstat()
                 members = [{"name": child.name, "file_type": stat.S_IFMT(child.lstat().st_mode),
@@ -324,7 +366,7 @@ class Exporter:
         for item in plan["files"]:
             logical = Path(item["logical_path"])
             actual = Path(item["physical_source"])
-            need(owner_root in logical.parents and owner_root in actual.parents
+            need(owner_root in logical.parents and physical_owned(actual, item["physical_source_owner"])
                  and actual.resolve(strict=True) == actual and pin(actual) == item["source_pin"],
                  "Native derivative source changed or escaped its exact owner.")
             destination = self.staging / category / logical.relative_to(self.target)
@@ -340,8 +382,12 @@ class Exporter:
             row = self.inventory.setdefault(key, {"path": key, **copied, "owners": []})
             if owner not in row["owners"]:
                 row["owners"].append(owner)
+            if item["physical_source_owner"] and item["physical_source_owner"]["package_id"] not in row["owners"]:
+                row["owners"].append(item["physical_source_owner"]["package_id"])
             row.setdefault("native_output_derivatives", []).append({"owner_output_parent": str(owner_root),
-                       "physical_source": str(actual), "followed_link_indexes": item["followed_link_indexes"],
+                       "physical_source": str(actual), "physical_source_owner": item["physical_source_owner"],
+                       "corresponding_source_path": ("cargo-home/" + actual.relative_to(self.home).as_posix() if item["physical_source_owner"] else None),
+                       "followed_link_indexes": item["followed_link_indexes"],
                        "ordinary_copy": True, "cache_import_eligible": category == "target"})
         for event in plan["links"]:
             for hop in event["hops"]:
@@ -372,123 +418,324 @@ class Exporter:
                     pending.append(edge["pkg"])
         return roots[0], reached
 
+    def public_source_get(self, host, path, metadata_redirect=False):
+        """Bounded public GET only; GitHub auth never crosses to GitLab/other hosts."""
+        need(host in {"api.github.com", "gitlab.com"} and path.startswith("/") and "\0" not in path,
+             "Unapproved original-public-source API host/path.")
+        if not hasattr(self, "license_api_cache"):
+            self.license_api_cache = {}
+        cache_key = (host, path)
+        if cache_key in self.license_api_cache:
+            return self.license_api_cache[cache_key]
+        redirects = []
+        for attempt in range(5):
+            connection = http.client.HTTPSConnection(host, timeout=30)
+            try:
+                headers = {"Accept": "application/json", "User-Agent": "official44-original-source-license-preflight", "Cache-Control": "no-cache"}
+                if host == "api.github.com":
+                    headers.update({"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10"})
+                    token = os.environ.get("LICENSE_GITHUB_TOKEN")
+                    if token:
+                        headers["Authorization"] = "Bearer " + token
+                observed_nonce = uuid.uuid4().hex
+                connection.request("GET", path + ("&" if "?" in path else "?") + "observed=" + observed_nonce, headers=headers)
+                response = connection.getresponse()
+                body = response.read(8 * 1024 * 1024 + 1)
+                need(len(body) <= 8 * 1024 * 1024, "Original public-source API response exceeds bounded gate.")
+                if response.status in {301, 302, 307, 308}:
+                    need(metadata_redirect, "Redirect on immutable original source object refused.")
+                    location = urllib.parse.urlsplit(urllib.parse.urljoin("https://" + host + path, response.getheader("Location") or ""))
+                    need(location.scheme == "https" and location.hostname == host and location.port is None
+                         and not location.username and not location.password and not location.fragment,
+                         "Original repository metadata redirect leaves the same exact public provider.")
+                    redirect_query = urllib.parse.parse_qsl(location.query, keep_blank_values=True, strict_parsing=True)
+                    need(not redirect_query or redirect_query == [("observed", observed_nonce)],
+                         "Original metadata redirect query is not our one exact observed nonce.")
+                    predicate = (r"/(?:repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|repositories/[0-9]+)" if host == "api.github.com"
+                                 else r"/api/v4/projects/(?:[0-9]+|[A-Za-z0-9_.%/-]+)")
+                    need(re.fullmatch(predicate, location.path), "Unexpected repository metadata redirect route.")
+                    redirects.append({"from_path": path, "to_path": location.path, "status": response.status})
+                    path = location.path
+                    continue
+                need(response.status == 200, "Original public-source API read unconfirmed (HTTP " + str(response.status) + ").")
+                result = (json.loads(body), {"final_path": path, "redirects": redirects, "next_page": response.getheader("X-Next-Page") or ""})
+                self.license_api_cache[cache_key] = result
+                return result
+            finally:
+                connection.close()
+        raise RuntimeError("Original public repository metadata redirect limit exceeded.")
+
     def original_license_fallback(self, package_id, package, root):
-        """Exact original-public-source text; VCS data is a locator, not source equivalence."""
+        """Actual original texts bound to the exact authored manifest and public VCS commit."""
         vcs_path = root / ".cargo_vcs_info.json"
         vcs = json.loads(vcs_path.read_text(encoding="utf-8"))
         commit = vcs["git"]["sha1"]
         need(re.fullmatch(r"[0-9a-f]{40}", commit) and vcs["git"].get("dirty", False) is False,
-             "Original source licence fallback requires an exact non-dirty reported VCS commit.")
-        path_in_vcs = vcs.get("path_in_vcs", "")
-        need(isinstance(path_in_vcs, str) and "\\" not in path_in_vcs and "\0" not in path_in_vcs
-             and not path_in_vcs.startswith("/") and not any(part in {"", ".", ".."} for part in path_in_vcs.split("/") if path_in_vcs),
-             "Original VCS package path is not canonical repository-relative POSIX text.")
-        parsed = urllib.parse.urlsplit(package.get("repository") or "")
+             "Original licence fallback needs an exact non-dirty reported VCS commit.")
+        authored_manifest = root / "Cargo.toml.orig"
+        authored_pin = pin(authored_manifest)
+        authored_bytes = authored_manifest.read_bytes()
+        authored = tomllib.loads(authored_bytes.decode())["package"]
+        # Repository/homepage is an authored locator, never a replacement for VCS/manifest identity.
+        locator_role = "repository" if package.get("repository") else "homepage"
+        locator = package.get(locator_role) or ""
+        locator_declaration = authored.get(locator_role)
+        locator_inherited = isinstance(locator_declaration, dict) and locator_declaration == {"workspace": True}
+        need(locator_declaration == locator or locator_inherited,
+             "Original source locator is not an authored scalar or explicit workspace inheritance declaration.")
+        parsed = urllib.parse.urlsplit(locator)
+        need(parsed.scheme == "https" and parsed.hostname in {"github.com", "gitlab.com"} and parsed.port is None
+             and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment,
+             "Original source requires an authored canonical public GitHub/GitLab locator.")
         parts = parsed.path.strip("/").split("/")
-        need(parsed.scheme == "https" and parsed.hostname == "github.com" and not parsed.username and not parsed.password
-             and parsed.port is None and not parsed.query and not parsed.fragment and len(parts) == 2,
-             "Original package repository must be an exact canonical public GitHub repository URL.")
-        owner, repository = parts
-        repository = repository[:-4] if repository.endswith(".git") else repository
-        need(re.fullmatch(r"[A-Za-z0-9_.-]+", owner) and re.fullmatch(r"[A-Za-z0-9_.-]+", repository)
-             and repository not in {".", ".."}, "Unsafe original GitHub repository identity.")
-        repo = owner + "/" + repository
-        if not hasattr(self, "license_api_cache"):
-            self.license_api_cache = {}
-        def get(suffix):
-            key = (repo, suffix)
-            if key in self.license_api_cache:
-                return self.license_api_cache[key]
-            connection = http.client.HTTPSConnection("api.github.com", timeout=30)
-            try:
-                headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10",
-                           "User-Agent": "official44-original-source-license-preflight", "Cache-Control": "no-cache"}
-                token = os.environ.get("LICENSE_GITHUB_TOKEN")
-                if token:
-                    headers["Authorization"] = "Bearer " + token
-                connection.request("GET", "/repos/" + repo + suffix + ("&" if "?" in suffix else "?") + "observed=" + uuid.uuid4().hex,
-                                   headers=headers)
-                response = connection.getresponse()
-                body = response.read(8 * 1024 * 1024 + 1)
-                need(response.status == 200 and len(body) <= 8 * 1024 * 1024, "Original public-source API read unconfirmed or exceeds bounded response gate.")
-                value = json.loads(body)
-                self.license_api_cache[key] = value
-                return value
-            finally:
-                connection.close()
-        metadata = get("")
-        need(metadata["private"] is False and metadata["full_name"].casefold() == repo.casefold(), "Refuse a private or mismatched original source repository.")
-        actual_commit = get("/git/commits/" + commit)
-        need(actual_commit["sha"] == commit and re.fullmatch(r"[0-9a-f]{40}", actual_commit["tree"]["sha"]), "Original source commit/tree binding mismatch.")
-        tree_sha = actual_commit["tree"]["sha"]
-        def tree(sha):
-            value = get("/git/trees/" + sha)
-            need(value["sha"] == sha and value.get("truncated") is False, "Unresolved or truncated exact original source tree.")
-            return value["tree"]
+        need(all(re.fullmatch(r"[A-Za-z0-9_.-]+", value) and value not in {".", ".."} for value in parts), "Unsafe original repository path.")
+        if parsed.hostname == "github.com":
+            need(len(parts) == 2 or len(parts) >= 4 and parts[2] == "tree", "Unrecognized authored GitHub source locator route.")
+            repo_parts = parts[:2]
+        else:
+            route = parts.index("-") if "-" in parts else len(parts)
+            need(route == len(parts) or len(parts) >= route + 3 and parts[route + 1] == "tree", "Unrecognized authored GitLab source locator route.")
+            repo_parts = parts[:route]
+            need(len(repo_parts) >= 2, "GitLab project namespace is missing.")
+        repo_parts[-1] = repo_parts[-1][:-4] if repo_parts[-1].endswith(".git") else repo_parts[-1]
+        repo_locator = "/".join(repo_parts)
+        provider = parsed.hostname
+        host = "api.github.com" if provider == "github.com" else "gitlab.com"
+        metadata_path = "/repos/" + repo_locator if provider == "github.com" else "/api/v4/projects/" + urllib.parse.quote(repo_locator, safe="")
+        metadata, metadata_read = self.public_source_get(host, metadata_path, True)
+        if provider == "github.com":
+            need(metadata["private"] is False and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", metadata["full_name"]), "Refuse private/invalid canonical original repository.")
+            repo = metadata["full_name"]
+            prefix = "/repos/" + repo
+            actual_commit, _ = self.public_source_get(host, prefix + "/git/commits/" + commit)
+            need(actual_commit["sha"] == commit and re.fullmatch(r"[0-9a-f]{40}", actual_commit["tree"]["sha"]), "Exact original commit/tree identity mismatch.")
+            tree_sha = actual_commit["tree"]["sha"]
+            recursive, _ = self.public_source_get(host, prefix + "/git/trees/" + tree_sha + "?recursive=1")
+            need(recursive["sha"] == tree_sha and recursive.get("truncated") is False, "Exact original tree truncated/unresolved.")
+            entries = recursive["tree"]
+            tree_basis = "authoritative_commit_tree_sha"
+            blob_route = prefix + "/git/blobs/"
+        else:
+            need(metadata["visibility"] == "public" and isinstance(metadata["id"], int)
+                 and metadata["id"] > 0 and metadata["path_with_namespace"], "Refuse nonpublic or unidentified GitLab project.")
+            repo = metadata["path_with_namespace"]
+            prefix = "/api/v4/projects/" + str(metadata["id"])
+            actual_commit, _ = self.public_source_get(host, prefix + "/repository/commits/" + commit)
+            need(actual_commit["id"] == commit, "Exact original GitLab commit identity mismatch.")
+            entries = []
+            page = "1"
+            for count in range(1000):
+                batch, info = self.public_source_get(host, prefix + "/repository/tree?ref=" + commit + "&recursive=true&per_page=100&page=" + page)
+                need(isinstance(batch, list) and len(batch) <= 100, "Invalid bounded GitLab source tree page.")
+                entries.extend({**item, "sha": item["id"]} for item in batch)
+                next_page = info["next_page"]
+                if not next_page:
+                    break
+                need(next_page.isdecimal() and int(next_page) == int(page) + 1, "Unconfirmed GitLab source tree pagination.")
+                page = next_page
+            else:
+                raise RuntimeError("GitLab original source tree exceeds bounded pagination.")
+            # GitLab returns exact-ref ls-tree entries, not an API commit tree field.
+            # Reconstruct and verify every included child tree; record this root as derived.
+            tree_sha = None
+            tree_basis = "derived_git_tree_from_complete_exact_commit_paginated_entries"
+            blob_route = prefix + "/repository/blobs/"
+        need(len(entries) <= 100000, "Original source tree exceeds bounded entries.")
+        by_path = {}
+        for entry in entries:
+            path = entry["path"]
+            need(isinstance(path, str) and not path.startswith("/") and "\\" not in path and "\0" not in path
+                 and all(component not in {"", ".", ".."} for component in path.split("/"))
+                 and path not in by_path and re.fullmatch(r"[0-9a-f]{40}", entry["sha"]), "Unsafe/duplicate original Git tree identity.")
+            by_path[path] = entry
+        if provider == "gitlab.com":
+            def tree_hash(prefix_path):
+                direct = [item for path, item in by_path.items() if str(PurePosixPath(path).parent) in {prefix_path or "."}]
+                data = b""
+                for item in sorted(direct, key=lambda value: (PurePosixPath(value["path"]).name + ("/" if value["type"] == "tree" else "")).encode()):
+                    if item["type"] == "tree":
+                        need(tree_hash(item["path"]) == item["sha"], "GitLab exact-ref child tree bytes/SHA mismatch.")
+                    data += item["mode"].lstrip("0").encode() + b" " + PurePosixPath(item["path"]).name.encode() + b"\0" + bytes.fromhex(item["sha"])
+                return hashlib.sha1(b"tree " + str(len(data)).encode() + b"\0" + data).hexdigest()
+            tree_sha = tree_hash("")
         def blob(entry):
-            need(isinstance(entry["path"], str) and entry["path"] not in {"", ".", ".."}
-                 and not any(character in entry["path"] for character in ("/", "\\", "\0")),
-                 "Original nonrecursive tree leaf path is unsafe.")
-            need(entry["type"] == "blob" and entry["mode"] in {"100644", "100755"}
-                 and re.fullmatch(r"[0-9a-f]{40}", entry["sha"]), "Original licence/manifest must be an exact regular Git blob.")
-            value = get("/git/blobs/" + entry["sha"])
-            need(value["sha"] == entry["sha"] and value["encoding"] == "base64" and value["size"] <= 1024 * 1024,
-                 "Original text blob identity/encoding/size unconfirmed.")
+            need(entry["type"] == "blob" and entry["mode"] in {"100644", "100755"}, "Original manifest/notice is not a regular Git blob.")
+            value, _ = self.public_source_get(host, blob_route + entry["sha"])
+            need(value["sha"] == entry["sha"] and value["encoding"] == "base64" and 0 <= value["size"] <= 1024 * 1024, "Original blob encoding/size/identity unresolved.")
             content = base64.b64decode("".join(value["content"].splitlines()), validate=True)
-            need(len(content) == value["size"] and hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest() == entry["sha"],
-                 "Original text blob Git SHA/bytes do not match its exact tree entry.")
+            need(len(content) == value["size"] and hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest() == entry["sha"], "Original Git blob SHA/bytes mismatch.")
             content.decode("utf-8")
             return content
-        ancestors = [("", tree(tree_sha))]
+        reported_path = vcs.get("path_in_vcs")
+        if reported_path is None:
+            canonical_authored_bytes = authored_bytes.replace(b"\r\n", b"\n")
+            authored_git_shas = {hashlib.sha1(b"blob " + str(len(body)).encode() + b"\0" + body).hexdigest()
+                                 for body in (authored_bytes, canonical_authored_bytes)}
+            matches = [path for path, item in by_path.items() if PurePosixPath(path).name == "Cargo.toml"
+                       and item["type"] == "blob" and item["mode"] in {"100644", "100755"} and item["sha"] in authored_git_shas]
+            need(len(matches) == 1, "Absent path_in_vcs requires one unique exact authored manifest blob in the authoritative commit tree.")
+            manifest_path = matches[0]
+            path_in_vcs = str(PurePosixPath(manifest_path).parent)
+            path_in_vcs = "" if path_in_vcs == "." else path_in_vcs
+            path_basis = "unique_original_manifest_blob_raw_or_exact_CRLF_to_LF_discovery"
+        else:
+            need(isinstance(reported_path, str) and "\\" not in reported_path and "\0" not in reported_path
+                 and not reported_path.startswith("/") and all(value not in {"", ".", ".."} for value in reported_path.split("/") if reported_path), "Unsafe reported original VCS path.")
+            path_in_vcs = reported_path
+            manifest_path = (path_in_vcs + "/" if path_in_vcs else "") + "Cargo.toml"
+            path_basis = "reported_path_in_vcs_verified"
+        ancestor_paths = [""]
+        current = ""
         for component in PurePosixPath(path_in_vcs).parts if path_in_vcs else ():
-            prefix, entries = ancestors[-1]
-            matches = [entry for entry in entries if entry["path"] == component]
-            need(len(matches) == 1 and matches[0]["type"] == "tree" and matches[0]["mode"] == "040000",
-                 "Original VCS path must walk exact directories, not links/gitlinks.")
-            ancestors.append(((prefix + "/" if prefix else "") + component, tree(matches[0]["sha"])))
-        manifest_entries = [entry for entry in ancestors[-1][1] if entry["path"] == "Cargo.toml"]
-        need(len(manifest_entries) == 1, "Original package manifest unresolved at exact VCS path.")
-        original_manifest = blob(manifest_entries[0])
-        authored_manifest = root / "Cargo.toml.orig"
-        need(authored_manifest.is_file() and authored_manifest.resolve(strict=True) == authored_manifest
-             and authored_manifest.read_bytes() == original_manifest, "Packaged authored manifest differs from exact original VCS manifest.")
-        original_package = tomllib.loads(original_manifest.decode())["package"]
+            current = (current + "/" if current else "") + component
+            need(current in by_path and by_path[current]["type"] == "tree" and by_path[current]["mode"] == "040000", "Original package path contains a link/gitlink/unresolved directory.")
+            ancestor_paths.append(current)
+        need(manifest_path in by_path, "Exact original VCS manifest is absent.")
+        original_manifest_bytes = blob(by_path[manifest_path])
+        raw_byte_identical = original_manifest_bytes == authored_bytes
+        exact_crlf_to_lf_equal = original_manifest_bytes.replace(b"\r\n", b"\n") == authored_bytes.replace(b"\r\n", b"\n")
+        need(exact_crlf_to_lf_equal and pin(authored_manifest) == authored_pin,
+             "Packaged authored manifest differs beyond the exact CRLF-to-LF transform from original VCS manifest.")
+        original_package = tomllib.loads(original_manifest_bytes.decode())["package"]
+        original_workspace = None
+        explicit_workspace = original_package.get("workspace")
+        if explicit_workspace is not None:
+            need(isinstance(explicit_workspace, str) and explicit_workspace and not explicit_workspace.startswith("/")
+                 and "\\" not in explicit_workspace and "\0" not in explicit_workspace,
+                 "Original package.workspace is not bounded repository-relative text.")
+            workspace_parts = list(PurePosixPath(path_in_vcs).parts) if path_in_vcs else []
+            for component in explicit_workspace.split("/"):
+                if component in {"", "."}:
+                    continue
+                if component == "..":
+                    need(workspace_parts, "Explicit original workspace escapes the exact public repository.")
+                    workspace_parts.pop()
+                else:
+                    workspace_parts.append(component)
+            workspace_path = "/".join(workspace_parts)
+            prefix_path = ""
+            for component in workspace_parts:
+                prefix_path = (prefix_path + "/" if prefix_path else "") + component
+                need(prefix_path in by_path and by_path[prefix_path]["type"] == "tree" and by_path[prefix_path]["mode"] == "040000",
+                     "Explicit original workspace path contains links/gitlinks/unresolved directories.")
+            workspace_manifest_path = (workspace_path + "/" if workspace_path else "") + "Cargo.toml"
+            need(workspace_manifest_path in by_path, "Explicit original workspace manifest is absent.")
+            workspace_document = tomllib.loads(blob(by_path[workspace_manifest_path]).decode())
+            need(isinstance(workspace_document.get("workspace"), dict), "Explicit original owning manifest does not declare [workspace].")
+            original_workspace = {"path": workspace_path, "manifest_blob": by_path[workspace_manifest_path]["sha"],
+                                  "selection": "explicit_package_workspace", "document": workspace_document["workspace"]}
+        else:
+            # Stop at the closest actual workspace boundary even when a field is absent.
+            for ancestor in reversed(ancestor_paths):
+                workspace_manifest_path = (ancestor + "/" if ancestor else "") + "Cargo.toml"
+                if workspace_manifest_path not in by_path:
+                    continue
+                workspace_document = tomllib.loads(blob(by_path[workspace_manifest_path]).decode())
+                if isinstance(workspace_document.get("workspace"), dict):
+                    original_workspace = {"path": ancestor, "manifest_blob": by_path[workspace_manifest_path]["sha"],
+                                          "selection": "closest_actual_workspace_boundary", "document": workspace_document["workspace"]}
+                    break
+        def inherited_field(field):
+            need(original_workspace is not None, "Original owning workspace identity is unresolved.")
+            value = original_workspace["document"].get("package", {}).get(field)
+            need(value is not None, "Original selected workspace.package field absent: " + field)
+            return value
+        if locator_inherited:
+            inherited_locator = inherited_field(locator_role)
+            need(isinstance(inherited_locator, str) and inherited_locator == locator,
+                 "Original selected workspace repository/homepage differs from normalized Cargo metadata.")
         need(original_package["name"] == package["name"], "Original VCS package name mismatch.")
         for field in ("version", "license"):
             expected = original_package.get(field)
             if isinstance(expected, dict) and expected.get("workspace") is True:
-                inherited = []
-                for _, entries in reversed(ancestors):
-                    candidates = [entry for entry in entries if entry["path"] == "Cargo.toml"]
-                    if candidates:
-                        value = tomllib.loads(blob(candidates[0]).decode()).get("workspace", {}).get("package", {}).get(field)
-                        if value is not None:
-                            inherited.append(value)
-                            break
-                need(len(inherited) == 1, "Original workspace package identity/licence inheritance unresolved.")
-                expected = inherited[0]
+                need(expected == {"workspace": True}, "Unknown authored workspace inheritance form.")
+                expected = inherited_field(field)
             need(expected == package.get(field), "Original package version/licence metadata mismatch.")
         candidates = []
-        for prefix, entries in reversed(ancestors):
-            for entry in entries:
-                if re.search(r"(^|[-_.])(licen[cs]e|copying|notice)([-_.]|$)", entry["path"], re.I):
-                    need(entry["type"] == "blob" and entry["mode"] in {"100644", "100755"}, "Original ancestor notice is a link/nonregular object.")
-                    content = blob(entry)
-                    need(content.strip() and b"\0" not in content, "Original source licence text is empty or nontext.")
-                    relative = (prefix + "/" if prefix else "") + entry["path"]
-                    destination = self.root / "license-preflight-refs" / hashlib.sha256(package_id.encode()).hexdigest()[:20] / relative
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    if not destination.exists():
-                        destination.write_bytes(content)
-                    need(destination.read_bytes() == content, "Conflicting original source notice bytes.")
-                    candidates.append({"path": str(destination), "pin": pin(destination), "repo_relative_path": relative,
-                                       "url": "https://github.com/" + repo + "/blob/" + commit + "/" + urllib.parse.quote(relative, safe="/"),
-                                       "commit": commit, "tree": tree_sha, "blob": entry["sha"], "repository": repo,
-                                       "scope": "original_package_or_ancestor_notice_text"})
-        need(candidates, "No original licence text found at exact package/ancestor source paths.")
-        return {"package_id": package_id, "vcs": {"pin": pin(vcs_path), "commit": commit, "path_in_vcs": path_in_vcs},
-                "authored_manifest_pin": pin(authored_manifest), "original_manifest_blob": manifest_entries[0]["sha"],
-                "original_manifest_byte_identical": True, "whole_crate_source_equivalence_claimed": False, "notices": candidates}
+        notice_total_bytes = 0
+        selected_notices = {}
+        for ancestor in reversed(ancestor_paths):
+            for relative, entry in sorted(by_path.items()):
+                parent = str(PurePosixPath(relative).parent)
+                if parent != (ancestor or ".") or not re.search(r"(^|[-_.])(licen[cs]e|copying|notice|unlicense)([-_.]|$)", PurePosixPath(relative).name, re.I):
+                    continue
+                if entry["type"] == "tree":
+                    need(entry["mode"] == "040000", "Original matched notice directory is not an ordinary exact Git tree.")
+                    descendants = [(path, child) for path, child in sorted(by_path.items()) if path.startswith(relative + "/")]
+                    need(len(descendants) <= 1024, "Original notice directory exceeds bounded descendant gate.")
+                    for path, child in descendants:
+                        need(len(PurePosixPath(path).relative_to(PurePosixPath(relative)).parts) <= 32,
+                             "Original notice directory exceeds bounded depth.")
+                        if child["type"] == "tree":
+                            need(child["mode"] == "040000", "Original notice descendant directory is nonordinary.")
+                            continue
+                        need(child["type"] == "blob" and child["mode"] in {"100644", "100755"},
+                             "Original notice directory includes a link/gitlink/special entry.")
+                        selected_notices[path] = (child, "original_actual_notice_directory_regular_descendant_text", relative)
+                else:
+                    need(entry["type"] == "blob" and entry["mode"] in {"100644", "100755"},
+                         "Original ancestor notice is a link/gitlink/nonregular entry.")
+                    selected_notices[relative] = (entry, "original_package_or_ancestor_notice_text", None)
+        need(len(selected_notices) <= 1024, "Original selected licence text inventory exceeds bounded count.")
+        for relative, (entry, notice_scope, notice_directory) in sorted(selected_notices.items()):
+            content = blob(entry)
+            need(content.strip() and b"\0" not in content, "Original notice text is empty/nontext.")
+            notice_total_bytes += len(content)
+            need(notice_total_bytes <= 8 * 1024 * 1024, "Original notice text collection exceeds bounded bytes.")
+            destination = self.root / "license-preflight-refs" / hashlib.sha256(package_id.encode()).hexdigest()[:20] / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not destination.exists():
+                destination.write_bytes(content)
+            need(destination.read_bytes() == content, "Conflicting original public notice bytes.")
+            url = ("https://github.com/" + repo + "/blob/" if provider == "github.com" else "https://gitlab.com/" + repo + "/-/blob/") + commit + "/" + urllib.parse.quote(relative, safe="/")
+            candidates.append({"path": str(destination), "pin": pin(destination), "repo_relative_path": relative,
+                               "url": url, "commit": commit, "tree": tree_sha, "tree_identity_basis": tree_basis,
+                               "blob": entry["sha"], "repository": repo, "provider": provider,
+                               "scope": notice_scope, "notice_directory_relative_path": notice_directory})
+        if not candidates and package.get("license") == "CC0-1.0" and original_package.get("license") == "CC0-1.0":
+            standard = Path(__file__).resolve().parent / "public-licenses/standard/CC0-1.0.txt"
+            actual = pin(standard)
+            need(actual["bytes"] == 7048 and actual["sha256"] == "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499", "Reviewed actual standardized CC0 text changed.")
+            destination = self.root / "license-preflight-refs" / hashlib.sha256(package_id.encode()).hexdigest()[:20] / "text/CC0-1.0.txt"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not destination.exists():
+                shutil.copy2(standard, destination)
+            need(pin(destination) == actual, "Standardized CC0 derivative not byte/mtime identical.")
+            candidates.append({"path": str(destination), "pin": actual, "repo_relative_path": "text/CC0-1.0.txt",
+                               "url": "https://github.com/spdx/license-list-data/blob/31ba1a50e5397e00a304dbadc76531740e89ee48/text/CC0-1.0.txt",
+                               "repository": "spdx/license-list-data", "commit": "31ba1a50e5397e00a304dbadc76531740e89ee48",
+                               "tree": "dc9f030bcb3744a0a351fad8eafb94015f4305fa", "blob": "0e259d42c996742e9e3cba14c677129b2c1b6311",
+                               "scope": "standardized_CC0_terms_bound_to_byte_identical_original_authored_CC0_declaration",
+                               "author_repository_notice_claimed": False, "grant_manifest_blob": by_path[manifest_path]["sha"]})
+        need(candidates, "No actual original or explicitly declaration-bound standardized licence text resolved.")
+        return {"package_id": package_id, "vcs": {"pin": pin(vcs_path), "commit": commit, "reported_path_in_vcs": reported_path,
+                "path_in_vcs": path_in_vcs, "path_identity_basis": path_basis}, "provider": provider,
+                "authored_locator_role": locator_role, "authored_locator": locator, "canonical_repository": repo,
+                "repository_metadata_read": metadata_read, "authored_manifest_pin": authored_pin,
+                "original_manifest_blob": by_path[manifest_path]["sha"], "original_manifest_byte_identical": raw_byte_identical,
+                "exact_crlf_to_lf_equal": exact_crlf_to_lf_equal,
+                "original_manifest_bytes": len(original_manifest_bytes),
+                "original_manifest_sha256": hashlib.sha256(original_manifest_bytes).hexdigest(),
+                "authored_locator_inherited_from_exact_original_workspace": locator_inherited,
+                "original_workspace": ({key: value for key, value in original_workspace.items() if key != "document"} if original_workspace else None),
+                "whole_crate_source_equivalence_claimed": False, "notices": candidates}
+
+    def license_omission_closure(self, meta, unresolved, actual_compiled_ids):
+        """Omit every actual external dependent, through workspace nodes too."""
+        reverse = {}
+        for node in meta["resolve"]["nodes"]:
+            for edge in node["deps"]:
+                need(edge["dep_kinds"] and all(value["kind"] in {None, "build", "dev"} for value in edge["dep_kinds"]), "Unknown omission dependency kind.")
+                if any(value["kind"] in {None, "build"} for value in edge["dep_kinds"]):
+                    reverse.setdefault(edge["pkg"], set()).add(node["id"])
+        omitted = set(unresolved)
+        pending = list(omitted)
+        while pending:
+            for dependent in reverse.get(pending.pop(), ()):
+                if dependent not in omitted:
+                    omitted.add(dependent)
+                    pending.append(dependent)
+        return omitted.intersection(actual_compiled_ids)
 
     def license_preflight_package(self, package_id, package, contract):
         root = Path(package["manifest_path"]).parent
@@ -498,7 +745,7 @@ class Exporter:
             candidates = [ancestor for ancestor in (root, *root.parents) if self.home in ancestor.parents and (ancestor / ".git").exists()]
             need(candidates, "Fetched original external Git source root unresolved.")
             source_root = candidates[0]
-        license_files = [path for path in files(source_root) if re.search(r"(^|[-_.])(licen[cs]e|copying|notice)([-_.]|$)", path.name, re.I)]
+        license_files = [path for path in files(source_root) if re.search(r"(^|[-_.])(licen[cs]e|copying|notice|unlicense)([-_.]|$)", path.name, re.I)]
         need(package.get("license") or package.get("license_file"), "Package licensing metadata unresolved.")
         fallback = None
         if package["name"] == "ct2rs":
@@ -531,6 +778,15 @@ class Exporter:
         cmake = self.text("cmake-version", ["cmake", "--version"])
         lock_before = pin(self.official / "Cargo.lock")
         need(lock_before["sha256"] == OFFICIAL_LOCK_SHA, "Exact reviewed official Cargo.lock mismatch.")
+        official_lock = tomllib.loads((self.official / "Cargo.lock").read_text())
+        registry_lock_checksums = {}
+        for entry in official_lock["package"]:
+            if not (entry.get("source") or "").startswith(("registry+", "sparse+")):
+                continue
+            key = (entry["name"], entry["version"], entry["source"])
+            need(key not in registry_lock_checksums and re.fullmatch(r"[0-9a-f]{64}", entry.get("checksum") or ""),
+                 "Exact official registry lock owner/checksum ambiguous or absent.")
+            registry_lock_checksums[key] = entry["checksum"]
         contract_path = Path(__file__).resolve().parent / "public-license-provenance.json"
         contract_pin = pin(contract_path)
         contract = json.loads(contract_path.read_text())
@@ -556,6 +812,7 @@ class Exporter:
         app_root, reachable = self.app_non_dev_closure(meta, packages)
         preflight_ids = sorted(reachable.intersection(allowed))
         license_infos = {}
+        unresolved_licenses = {}
         for package_id in preflight_ids:
             package = allowed[package_id]
             try:
@@ -575,29 +832,50 @@ class Exporter:
                 print(json.dumps({"phase": "license-preflight-unresolved", "package_id": package_id,
                                   "name": package["name"], "version": package["version"], "source": package["source"],
                                   "repository": safe_repository, "manifest_path": package["manifest_path"],
-                                  "vcs": vcs, "reason": str(error), "Cargo_build_started": False}, sort_keys=True), flush=True)
-                raise
+                                  "vcs": vcs, "reason": str(error), "Cargo_build_started": False,
+                                  "publication_policy": "omit_owner_and_actual_compiled_dependents"}, sort_keys=True), flush=True)
+                unresolved_licenses[package_id] = {"name": package["name"], "version": package["version"],
+                                                   "source": package["source"], "reason": str(error)}
         print(json.dumps({"phase": "license-preflight-complete", "root_package_id": app_root, "target": self.args.target,
-                          "conservative_external_package_count": len(preflight_ids), "compiled_scope_claimed": False}, sort_keys=True), flush=True)
+                          "conservative_external_package_count": len(preflight_ids), "compiled_scope_claimed": False,
+                          "unresolved_package_ids": sorted(unresolved_licenses),
+                          "publication_policy": "omit_unresolved_and_all_actual_compiled_dependents"}, sort_keys=True), flush=True)
         raw = self.run("cargo-official-release", ["cargo", "build", "--locked", "--release", "-p", "omsi-app", "--bin", "openomsi",
                                                   "--target", self.args.target, "--message-format=json-render-diagnostics"])
         messages = [json.loads(line) for line in raw.read_text().splitlines() if line.startswith("{")]
         need(any(item.get("reason") == "build-finished" and item.get("success") is True for item in messages), "Natural build completion missing.")
         actual_compiled_ids = {message["package_id"] for message in messages
                                if message.get("reason") in {"compiler-artifact", "build-script-executed"} and message["package_id"] in allowed}
-        for package_id in sorted(actual_compiled_ids - license_infos.keys()):
+        for package_id in sorted(actual_compiled_ids - license_infos.keys() - unresolved_licenses.keys()):
             try:
                 license_infos[package_id] = self.license_preflight_package(package_id, allowed[package_id], contract)
             except Exception as error:
                 package = allowed[package_id]
                 print(json.dumps({"phase": "compiled-owner-license-unresolved", "package_id": package_id,
                                   "name": package["name"], "version": package["version"], "source": package["source"],
-                                  "reason": str(error), "Cargo_build_started": True, "export_started": False}, sort_keys=True), flush=True)
-                raise
+                                  "reason": str(error), "Cargo_build_started": True, "export_started": False,
+                                  "publication_policy": "omit_owner_and_actual_compiled_dependents"}, sort_keys=True), flush=True)
+                unresolved_licenses[package_id] = {"name": package["name"], "version": package["version"],
+                                                   "source": package["source"], "reason": str(error)}
+        license_omitted = self.license_omission_closure(meta, unresolved_licenses, actual_compiled_ids)
+        self.native_public_source_owners = []
+        for key in sorted(actual_compiled_ids - license_omitted):
+            package = allowed[key]
+            root = Path(package["manifest_path"]).parent
+            if package["name"] not in {"ct2rs", "cxx"}:
+                continue
+            need(root.resolve(strict=True) == root and self.home in root.parents and key in license_infos,
+                 "Native source alias owner must be an actual licensed canonical external package.")
+            selected = root if package["name"] == "ct2rs" else root / "include/cxx.h"
+            need(selected.resolve(strict=True) == selected, "Native public alias destination must be canonical/no-link.")
+            self.native_public_source_owners.append({"package_id": key, "source_root": str(root),
+                 "selected_path": str(selected), "allow_descendants": package["name"] == "ct2rs",
+                 "license_info_sha256": hashlib.sha256(json.dumps(license_infos[key], sort_keys=True, separators=(",", ":")).encode()).hexdigest()})
+        self.native_all_package_roots = [{"package_id": key, "source_root": str(Path(value["manifest_path"]).parent)} for key, value in packages.items()]
         native_plans = {}
         incomplete = set()
         for message in messages:
-            if message.get("reason") != "build-script-executed" or message["package_id"] not in allowed:
+            if message.get("reason") != "build-script-executed" or message["package_id"] not in allowed or message["package_id"] in license_omitted:
                 continue
             package_id = message["package_id"]
             package = allowed[package_id]
@@ -620,6 +898,10 @@ class Exporter:
             need(package_id in packages, "Unresolved actual compiler package identity.")
             if package_id not in allowed:
                 excluded.append(package_id)
+                continue
+            if package_id in license_omitted:
+                omitted_artifacts.append({"package_id": package_id, "filenames": message.get("filenames", []),
+                                          "reason": "unresolved_license_owner_or_transitive_dependent_no_bytes_exported"})
                 continue
             compiled.add(package_id)
             package = allowed[package_id]
@@ -658,7 +940,7 @@ class Exporter:
             native_owners.append({key: value for key, value in plan.items() if key not in {"files", "directories"}})
         need(compiled, "Expected real external Rust dependency closure missing.")
         if self.args.architecture == "arm64":
-            need(any(allowed[key]["name"] == "ct2rs" for key in compiled), "Expected real ARM ct2rs dependency closure missing.")
+            need(any(allowed[key]["name"] == "ct2rs" for key in actual_compiled_ids), "Expected real ARM ct2rs dependency closure missing.")
         # Cargo797e8a9bc's legacy layout explicitly uses $pkgname-$META. Do not
         # equate META with artifact hashes. Exact-name candidates are exhaustive;
         # reject ANY name shared with a workspace/path package.
@@ -672,9 +954,9 @@ class Exporter:
                     continue
                 candidates = by_name[match[1]]
                 need(all(key in allowed for key in candidates), "Fingerprint name collides with an excluded workspace/path package.")
-                if any(key in incomplete for key in candidates):
+                if any(key in incomplete or key in license_omitted or key in unresolved_licenses or key not in actual_compiled_ids or key not in license_infos for key in candidates):
                     omitted_fingerprints.append({"path": str(directory), "external_package_candidates": candidates,
-                                                 "reason": "native_owner_cache_incomplete_normal_rebuild_required"})
+                                                 "reason": "native_or_licence_owner_unavailable_normal_rebuild_required"})
                     continue
                 self.tree(directory, "target", {"external_package_candidates": candidates, "ownership": "verified Cargo-version exact package-name directory"}, self.target)
         source_rows = []
@@ -695,7 +977,7 @@ class Exporter:
                               if self.home in ancestor.parents and (ancestor / ".git").exists()]
                 need(candidates, "Fetched external Git source root is unresolved.")
                 source_root = candidates[0]
-            license_files = [path for path in files(source_root) if re.search(r"(^|[-_.])(licen[cs]e|copying|notice)([-_.]|$)", path.name, re.I)]
+            license_files = [path for path in files(source_root) if re.search(r"(^|[-_.])(licen[cs]e|copying|notice|unlicense)([-_.]|$)", path.name, re.I)]
             if package["name"] == "ct2rs":
                 need(package["version"] == "0.10.1", "Unreviewed ct2rs license fallback version.")
                 vcs = json.loads((root / ".cargo_vcs_info.json").read_text())
@@ -720,20 +1002,53 @@ class Exporter:
                     actual = Path(notice["path"])
                     need(pin(actual) == notice["pin"], "Original preflight notice bytes changed before compiled-source export.")
                     self.copy(actual, "original-license-texts", package_id, self.root / "license-preflight-refs")
-            self.tree(source_root, "cargo-home", package_id, self.home)
+            # A shared Git checkout may contain another omitted package; do not
+            # publish its bytes through a licensed sibling owner.
+            blocked_roots = [Path(packages[key]["manifest_path"]).parent for key in license_omitted | unresolved_licenses.keys()]
+            for source_file in files(source_root):
+                if any(blocked == source_file or blocked in source_file.parents for blocked in blocked_roots):
+                    continue
+                self.copy(source_file, "cargo-home", package_id, self.home)
+            registry_archive = None
+            if package["source"].startswith(("registry+", "sparse+")):
+                lock_key = (package["name"], package["version"], package["source"])
+                need(lock_key in registry_lock_checksums and root.parent.parent == self.home / "registry/src",
+                     "Exported registry owner is not an exact official lock/source-cache identity.")
+                archive = self.home / "registry/cache" / root.parent.name / (package["name"] + "-" + package["version"] + ".crate")
+                archive_pin = pin(archive)
+                need(archive_pin["sha256"] == registry_lock_checksums[lock_key],
+                     "Actual public registry archive SHA does not match the exact official lock owner checksum.")
+                self.copy(archive, "cargo-home", package_id, self.home)
+                archive_key = "cargo-home/" + archive.relative_to(self.home).as_posix()
+                need(self.inventory[archive_key]["sha256"] == archive_pin["sha256"] and pin(archive) == archive_pin,
+                     "Corresponding public registry archive changed during export.")
+                registry_archive = {"path": archive_key, "origin_path": str(archive), "pin": archive_pin,
+                                    "lock_identity": {"name": lock_key[0], "version": lock_key[1], "source": lock_key[2],
+                                                      "checksum": registry_lock_checksums[lock_key]},
+                                    "checksum_verified_against_exact_official_lock": True}
             source_rows.append({"package_id": package_id, "name": package["name"], "version": package["version"],
                                 "source": package["source"], "license": package.get("license"),
-                                "original_source_root": str(source_root),
+                                "original_source_root": str(source_root), "registry_archive": registry_archive,
                                 "license_files": [{"path": path.relative_to(source_root).as_posix(),
-                                                   "sha256": pin(path)["sha256"]} for path in license_files],
+                                                   "sha256": self.inventory["cargo-home/" + path.relative_to(self.home).as_posix()]["sha256"]}
+                                                  for path in license_files
+                                                  if "cargo-home/" + path.relative_to(self.home).as_posix() in self.inventory
+                                                  and package_id in self.inventory["cargo-home/" + path.relative_to(self.home).as_posix()]["owners"]],
                                 "original_source_license_fallback": original_fallback,
                                 "additional_workspace_license": ({"path": "public-licenses/ct2rs-0.10.1/WORKSPACE-LICENSE",
                                     "sha256": "ed39d4eb1b651d31041f1dde23f4fa4a19a7ab87ebfc6858b3abfd47f66cb557",
                                     "source_url": "https://raw.githubusercontent.com/jkawamoto/ctranslate2-rs/2d2bc51c5c3f10ba91ade120414c0fb4ed196051/LICENSE"}
                                     if package["name"] == "ct2rs" else None)})
+        for item in self.inventory.values():
+            for derivative in item.get("native_output_derivatives", []):
+                source_key = derivative["corresponding_source_path"]
+                if source_key:
+                    need(source_key in self.inventory and self.inventory[source_key]["sha256"] == item["sha256"]
+                         and self.inventory[source_key]["bytes"] == item["bytes"],
+                         "Materialized native public alias lacks byte-identical included corresponding source.")
         license_inventory = {"official_commit": OFFICIAL_COMMIT, "official_tree": OFFICIAL_TREE,
                              "cargo_lock_sha256": lock_before["sha256"],
-                             "packages": [{key: row[key] for key in ("package_id", "name", "version", "source", "license", "license_files", "additional_workspace_license", "original_source_license_fallback")}
+                             "packages": [{key: row[key] for key in ("package_id", "name", "version", "source", "license", "license_files", "additional_workspace_license", "original_source_license_fallback", "registry_archive")}
                                           for row in source_rows]}
         license_sha = hashlib.sha256(json.dumps(license_inventory, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         need(pin(self.official / "Cargo.lock") == lock_before
@@ -755,6 +1070,9 @@ class Exporter:
                                          "scope": "conservative_target_filtered_non_dev_reachable_not_compiled_scope"},
                    "original_source_license_fallbacks": [license_infos[key]["fallback"] for key in sorted(compiled) if license_infos[key]["fallback"]],
                    "non_cache_license_prefix": "original-license-texts/",
+                   "unresolved_license_packages": [{"package_id": key, **value} for key, value in sorted(unresolved_licenses.items())],
+                   "license_omitted_actual_compiled_package_ids": sorted(license_omitted),
+                   "license_omission_policy": "no_source_native_fingerprint_or_artifact_bytes_for_unresolved_owners_and_all_actual_non_dev_compiled_dependents",
                    "native_cache_complete": not incomplete, "native_cache_incomplete_package_ids": sorted(incomplete),
                    "native_output_owners": native_owners, "non_cache_inspection_prefix": "inspection-native-output/",
                    "incomplete_package_target_artifacts_omitted": omitted_artifacts,
@@ -785,6 +1103,9 @@ class Exporter:
                                          "scope": "conservative_target_filtered_non_dev_reachable_not_compiled_scope"},
                    "original_source_license_fallbacks": [license_infos[key]["fallback"] for key in sorted(compiled) if license_infos[key]["fallback"]],
                    "non_cache_license_prefix": "original-license-texts/",
+                   "unresolved_license_packages": [{"package_id": key, **value} for key, value in sorted(unresolved_licenses.items())],
+                   "license_omitted_actual_compiled_package_ids": sorted(license_omitted),
+                   "license_omission_policy": "no_source_native_fingerprint_or_artifact_bytes_for_unresolved_owners_and_all_actual_non_dev_compiled_dependents",
                    "native_cache_complete": not incomplete, "native_cache_incomplete_package_ids": sorted(incomplete),
                    "native_output_owners": native_owners, "non_cache_inspection_prefix": "inspection-native-output/",
                    "seed_scope": "partial_external_dependency_material_normal_Cargo_freshness_rules_apply",
