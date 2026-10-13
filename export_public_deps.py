@@ -227,7 +227,9 @@ class Exporter:
                                           path.parent / ("lib" + message["target"]["name"] + "-" + match[1] + ".rmeta")):
                             if companion.exists():
                                 self.copy(companion, "target", package_id, self.target)
-        need(compiled and any(allowed[key]["name"] == "ct2rs" for key in compiled), "Expected real external Rust/ct2rs dependency closure missing.")
+        need(compiled, "Expected real external Rust dependency closure missing.")
+        if self.args.architecture == "arm64":
+            need(any(allowed[key]["name"] == "ct2rs" for key in compiled), "Expected real ARM ct2rs dependency closure missing.")
         # Cargo797e8a9bc's legacy layout explicitly uses $pkgname-$META. Do not
         # equate META with artifact hashes. Exact-name candidates are exhaustive;
         # reject ANY name shared with a workspace/path package.
