@@ -1,0 +1,54 @@
+{
+  "schema": "public-ct2rs-license-origin-v1",
+  "crate": "ct2rs",
+  "version": "0.10.1",
+  "crate_sha256": "b68f8baf9feaac18f4380e1079ed2c633f7703cee391d34521f5dded6c005725",
+  "vcs_commit": "2d2bc51c5c3f10ba91ade120414c0fb4ed196051",
+  "license": {
+    "path": "public-licenses/ct2rs-0.10.1/WORKSPACE-LICENSE",
+    "bytes": 1087,
+    "sha256": "ed39d4eb1b651d31041f1dde23f4fa4a19a7ab87ebfc6858b3abfd47f66cb557",
+    "source_url": "https://raw.githubusercontent.com/jkawamoto/ctranslate2-rs/2d2bc51c5c3f10ba91ade120414c0fb4ed196051/LICENSE"
+  },
+  "native_public_source_commits": {
+    "CTranslate2": "d44d2d069eb88c7b7804da864c10c201501cb4a9",
+    "ruy": "363f252289fb7a1fba1703d99196524698cb884d",
+    "cpuinfo": "082deffc80ce517f81dc2f3aebe6ba671fcd09c9"
+  },
+  "official": {
+    "commit": "6c82e0771b0695c038c5278cb21894d2b9776c5a",
+    "tree": "977fdb2987349fb9fca0a87a43e17b77f83f2158",
+    "cargo_lock_bytes": 176274,
+    "cargo_lock_sha256": "0c5f7b13f20c89c8874611b5ae13663b0e7c093205b6a769b24b86cc36ebea73"
+  },
+  "licenses": [
+    {
+      "path": "public-licenses/ct2rs-0.10.1/WORKSPACE-LICENSE",
+      "bytes": 1087,
+      "sha256": "ed39d4eb1b651d31041f1dde23f4fa4a19a7ab87ebfc6858b3abfd47f66cb557",
+      "source_url": "https://raw.githubusercontent.com/jkawamoto/ctranslate2-rs/2d2bc51c5c3f10ba91ade120414c0fb4ed196051/LICENSE",
+      "crate_relative_path": null
+    },
+    {
+      "path": "public-licenses/ct2rs-0.10.1/CTranslate2/LICENSE",
+      "bytes": 1115,
+      "sha256": "54aa79d9fe3c09e67a16dcd95b9e88676405a6ec174efda31036983cf7672ecb",
+      "source_url": "https://raw.githubusercontent.com/OpenNMT/CTranslate2/d44d2d069eb88c7b7804da864c10c201501cb4a9/LICENSE",
+      "crate_relative_path": "CTranslate2/LICENSE"
+    },
+    {
+      "path": "public-licenses/ct2rs-0.10.1/CTranslate2/third_party/ruy/LICENSE",
+      "bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source_url": "https://raw.githubusercontent.com/google/ruy/363f252289fb7a1fba1703d99196524698cb884d/LICENSE",
+      "crate_relative_path": "CTranslate2/third_party/ruy/LICENSE"
+    },
+    {
+      "path": "public-licenses/ct2rs-0.10.1/CTranslate2/third_party/ruy/third_party/cpuinfo/LICENSE",
+      "bytes": 1424,
+      "sha256": "8e7e60636c3aa0cb03571a1a841ce5697f9551ff92b3c426c2561613d15ade70",
+      "source_url": "https://raw.githubusercontent.com/pytorch/cpuinfo/082deffc80ce517f81dc2f3aebe6ba671fcd09c9/LICENSE",
+      "crate_relative_path": "CTranslate2/third_party/ruy/third_party/cpuinfo/LICENSE"
+    }
+  ]
+}

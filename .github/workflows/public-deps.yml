@@ -1,0 +1,91 @@
+name: Official 44 external Mac dependency seed
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release_assets:
+        description: Publish the reviewed dependency-only public release assets
+        required: true
+        default: false
+        type: boolean
+      approved_source_license_contract_sha256:
+        description: Reviewed official lock/public notice contract SHA256
+        required: false
+        default: ''
+        type: string
+      existing_release_tag:
+        description: Exact already-created approved public dependency release tag
+        required: false
+        default: ''
+        type: string
+      existing_release_id:
+        description: Exact already-created approved public dependency release ID
+        required: false
+        default: ''
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: official44-public-dependency-seed
+  cancel-in-progress: false
+jobs:
+  seed:
+    if: ${{ github.repository == 'filipmansfeld/PST-macOS-public-deps' && github.event.repository.private == false }}
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    strategy:
+      max-parallel: 2
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            arch: x86_64
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Read this public generic recipe
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          path: recipe
+      - name: Checkout only the exact official simulator source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: openOMSI-org/openOMSI
+          ref: 6c82e0771b0695c038c5278cb21894d2b9776c5a
+          persist-credentials: false
+          path: official
+      - name: Build and export external dependencies only
+        env:
+          SEED_ARCH: ${{ matrix.arch }}
+          SEED_TARGET: ${{ matrix.target }}
+          SEED_PUBLISH: ${{ inputs.publish_release_assets }}
+          APPROVED_SOURCE_LICENSE_SHA: ${{ inputs.approved_source_license_contract_sha256 }}
+        run: |
+          python3 recipe/export_public_deps.py --official "$GITHUB_WORKSPACE/official" \
+            --output "$RUNNER_TEMP/pst-public-deps-$SEED_ARCH" \
+            --architecture "$SEED_ARCH" --target "$SEED_TARGET" \
+            --publish-requested "$SEED_PUBLISH" --approved-source-license-contract "$APPROVED_SOURCE_LICENSE_SHA"
+      - name: Publish only explicitly approved dependency assets
+        if: ${{ inputs.publish_release_assets == true }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SEED_ARCH: ${{ matrix.arch }}
+          APPROVED_RELEASE_TAG: ${{ inputs.existing_release_tag }}
+          APPROVED_RELEASE_ID: ${{ inputs.existing_release_id }}
+        run: |
+          set -eu
+          dir="$RUNNER_TEMP/pst-public-deps-$SEED_ARCH/delivery"
+          test -f "$dir/deps-$SEED_ARCH.tar.gz"
+          test -f "$dir/deps-$SEED_ARCH.provenance.json"
+          test -f "$dir/deps-$SEED_ARCH.sha256"
+          python3 recipe/export_public_deps.py --publish-release --delivery "$dir" \
+            --architecture "$SEED_ARCH" --release-tag "$APPROVED_RELEASE_TAG" \
+            --release-id "$APPROVED_RELEASE_ID" --recipe-commit "$GITHUB_SHA"
+      - name: Record scope
+        if: always()
+        run: |
+          printf '%s\n' 'Official-source external dependency seed only; no engine/runtime verification. No Actions artifact/cache storage or paid/larger runner.' >> "$GITHUB_STEP_SUMMARY"
