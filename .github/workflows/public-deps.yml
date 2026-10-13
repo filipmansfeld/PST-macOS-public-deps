@@ -2,6 +2,15 @@ name: Official 44 external Mac dependency seed
 on:
   workflow_dispatch:
     inputs:
+      architectures:
+        description: Exact standard native runner selection
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - arm64
+          - x86_64
       publish_release_assets:
         description: Publish the reviewed dependency-only public release assets
         required: true
@@ -25,7 +34,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: official44-public-dependency-seed
+  group: official44-public-dependency-seed-${{ inputs.existing_release_id }}-${{ inputs.architectures }}
   cancel-in-progress: false
 jobs:
   seed:
@@ -36,14 +45,7 @@ jobs:
     strategy:
       max-parallel: 2
       fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            arch: arm64
-            target: aarch64-apple-darwin
-          - runner: macos-15-intel
-            arch: x86_64
-            target: x86_64-apple-darwin
+      matrix: ${{ fromJSON(inputs.architectures == 'arm64' && '{"include":[{"runner":"macos-15","arch":"arm64","target":"aarch64-apple-darwin"}]}' || inputs.architectures == 'x86_64' && '{"include":[{"runner":"macos-15-intel","arch":"x86_64","target":"x86_64-apple-darwin"}]}' || '{"include":[{"runner":"macos-15","arch":"arm64","target":"aarch64-apple-darwin"},{"runner":"macos-15-intel","arch":"x86_64","target":"x86_64-apple-darwin"}]}') }}
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Read this public generic recipe

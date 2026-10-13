@@ -25,7 +25,11 @@ import uuid
 OFFICIAL_COMMIT = "6c82e0771b0695c038c5278cb21894d2b9776c5a"
 OFFICIAL_TREE = "977fdb2987349fb9fca0a87a43e17b77f83f2158"
 OFFICIAL_LOCK_SHA = "0c5f7b13f20c89c8874611b5ae13663b0e7c093205b6a769b24b86cc36ebea73"
-CARGO_VERSION = "cargo 1.98.1 (797e8a9bc 2026-08-05)"
+CARGO_VERSIONS = {"arm64": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+                  "x86_64": "cargo 1.98.0 (797e8a9bc 2026-08-05)"}
+RUST_RELEASES = {"arm64": "1.98.1", "x86_64": "1.98.0"}
+RUST_COMMITS = {"arm64": "48a229ceaefd4985c50990b14116b6d856af0985",
+                "x86_64": "88d9e12ae178fab0fb5cc050a94da85685d449ea"}
 CARGO_LAYOUT_SOURCE = "https://github.com/rust-lang/cargo/blob/797e8a9bc/src/cargo/core/compiler/layout.rs"
 PROFILE = {"CARGO_PROFILE_RELEASE_OPT_LEVEL": "3", "CARGO_PROFILE_RELEASE_DEBUG": "0",
            "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "32", "CARGO_PROFILE_RELEASE_LTO": "off"}
@@ -145,9 +149,14 @@ class Exporter:
         need(self.text("official-commit", ["git", "rev-parse", "HEAD"]) == OFFICIAL_COMMIT, "Official source commit mismatch.")
         need(self.text("official-tree", ["git", "rev-parse", "HEAD^{tree}"]) == OFFICIAL_TREE, "Official source tree mismatch.")
         need(not self.text("official-clean", ["git", "status", "--porcelain", "--untracked-files=no"]), "Official source is modified.")
-        need(self.text("cargo-version", ["cargo", "--version"]) == CARGO_VERSION, "Refuse an unreviewed Cargo internal layout version.")
+        cargo = self.text("cargo-version", ["cargo", "--version"])
+        need(cargo == CARGO_VERSIONS[self.args.architecture], "Refuse an unreviewed Cargo internal layout version for this architecture.")
         rustc = self.text("rustc-version", ["rustc", "-vV"])
-        need("release: 1.98.1" in rustc and "host: " + self.args.target in rustc, "Native Rust toolchain differs from the reviewed seed contract.")
+        rust_fields = dict(line.split(": ", 1) for line in rustc.splitlines()[1:] if ": " in line)
+        need(rust_fields.get("release") == RUST_RELEASES[self.args.architecture]
+             and rust_fields.get("commit-hash") == RUST_COMMITS[self.args.architecture]
+             and rust_fields.get("host") == self.args.target,
+             "Native Rust toolchain differs from the exact reviewed architecture contract.")
         os_info = self.text("os-version", ["/usr/bin/sw_vers"])
         sdk = self.text("sdk-version", ["/usr/bin/xcrun", "--show-sdk-version"])
         clang = self.text("clang-version", ["/usr/bin/clang", "--version"])
@@ -288,7 +297,7 @@ class Exporter:
              and not self.text("official-still-clean", ["git", "status", "--porcelain", "--untracked-files=no"]), "Official source changed.")
         receipt = {"schema": "official44-external-macos-dependency-seed-v1", "status": "actual_external_dependency_export_completed",
                    "official": {"commit": OFFICIAL_COMMIT, "tree": OFFICIAL_TREE, "cargo_lock": lock_before},
-                   "toolchain": {"cargo": CARGO_VERSION, "rustc": rustc, "sdk": sdk, "clang": clang, "cmake": cmake, "os": os_info},
+                   "toolchain": {"cargo": cargo, "rustc": rustc, "sdk": sdk, "clang": clang, "cmake": cmake, "os": os_info},
                    "architecture": self.args.architecture, "target": self.args.target, "profile_env": PROFILE,
                    "canonical_origin": {"workspace": str(self.official), "cargo_home": str(self.home), "target": str(self.target)},
                    "layout_ownership_primary_source": CARGO_LAYOUT_SOURCE, "packages": source_rows,

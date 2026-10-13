@@ -1,6 +1,6 @@
 # Official-44 public Mac dependency cache
 
-Prepared locally only. Nothing has been created, pushed, dispatched or released.
+Revision 2 is prepared locally. It preserves the official source and public notice contract; publishing this revision is an explicit repository-owner action.
 
 This repository is `filipmansfeld/PST-macOS-public-deps`. It contains
 only this README, the generic exporter, the exact public ct2rs MIT notice and its
@@ -10,9 +10,19 @@ or private client source. A separate checkout is fixed to **official 0.2.44**:
 commit `6c82e0771b0695c038c5278cb21894d2b9776c5a`, tree
 `977fdb2987349fb9fca0a87a43e17b77f83f2158`.
 
-Both standard hosts are selected: `macos-15` ARM64 and `macos-15-intel` x86_64,
-in parallel on separate VMs, at most 45 minutes per job. The recipe uses fresh scoped Cargo
-home/target directories, native Cargo 1.98.1, opt3/debug0/CGU32/LTO **off**.
+The manual `architectures` choice selects `both` (default), `arm64`, or `x86_64`.
+The fixed standard hosts are `macos-15` ARM64 and `macos-15-intel` x86_64,
+in parallel on separate VMs when both are selected, at most 45 minutes per job.
+Runs are isolated by the supplied existing release ID and architecture selection,
+without cancelling another run. The recipe uses fresh scoped Cargo home/target
+directories and opt3/debug0/CGU32/LTO **off**. The exact native toolchains are:
+
+- ARM64: Cargo 1.98.1 (`797e8a9bc`), Rust 1.98.1 (`48a229ceaefd4985c50990b14116b6d856af0985`).
+- x86_64: Cargo 1.98.0 (`797e8a9bc`), Rust 1.98.0 (`88d9e12ae178fab0fb5cc050a94da85685d449ea`).
+
+Both Cargo versions use the same reviewed Cargo source commit/layout. The worker
+checks exact per-architecture versions and Rust commits, records the actual
+version output, and does not install or silently accept another toolchain.
 It builds the official executable only to obtain its external dependencies;
 it never runs or exports the simulator. No Tauri, .NET, OAuth, private API,
 maps, user profiles or private code are inputs.
@@ -64,8 +74,9 @@ inputs; never rewrite fingerprints to force reuse. All private workspace crates,
 especially the engine, must compile anew with `fresh:false` and current private
 source/version evidence. This recipe proves no private-build speedup or runtime.
 
-The next approval must explicitly cover creating the named **public** repository,
-publishing the reviewed recipe files and exact public license/provenance, a manual native pair, and dependency
-release assets with the reviewed source-license contract and automatic actual
-inventory gate.
-Earlier approval for a private repository does not cover these public actions.
+Publishing is limited to this named **public** recipe repository, the exact
+public license/provenance files, the selected standard native runners, and
+external-dependency release assets after the source-license inventory gate.
+Supply `publish_release_assets=true`, the exact reviewed source-license contract
+SHA256, and the actual pre-created release tag/ID. The release must target the
+same recipe commit as the dispatched workflow (`GITHUB_SHA`).
