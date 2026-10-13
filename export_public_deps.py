@@ -5,12 +5,13 @@ This file is a standalone public recipe. It imports no private repository module
 reads no credential store, and does not upload anything or execute the engine.
 """
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import http.client
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import re
 import shutil
@@ -19,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tomllib
 import urllib.parse
 import uuid
 
@@ -349,6 +351,168 @@ class Exporter:
                      and os.readlink(path) == hop["original_target"], "Native source link changed during its derivative copies.")
         verify_directories()
 
+    def app_non_dev_closure(self, meta, packages):
+        roots = [key for key, package in packages.items() if key in meta["workspace_members"]
+                 and package["name"] == "omsi-app"
+                 and Path(package["manifest_path"]) == self.official / "crates/omsi-app/Cargo.toml"]
+        need(len(roots) == 1, "Require exact official workspace omsi-app metadata identity.")
+        nodes = {node["id"]: node for node in meta["resolve"]["nodes"]}
+        reached = set()
+        pending = [roots[0]]
+        while pending:
+            key = pending.pop()
+            if key in reached:
+                continue
+            need(key in packages and key in nodes, "Unresolved exact metadata dependency identity: " + key)
+            reached.add(key)
+            for edge in nodes[key]["deps"]:
+                kinds = edge["dep_kinds"]
+                need(kinds and all(item["kind"] in {None, "build", "dev"} for item in kinds), "Unknown metadata dependency kind.")
+                if any(item["kind"] in {None, "build"} for item in kinds):
+                    pending.append(edge["pkg"])
+        return roots[0], reached
+
+    def original_license_fallback(self, package_id, package, root):
+        """Exact original-public-source text; VCS data is a locator, not source equivalence."""
+        vcs_path = root / ".cargo_vcs_info.json"
+        vcs = json.loads(vcs_path.read_text(encoding="utf-8"))
+        commit = vcs["git"]["sha1"]
+        need(re.fullmatch(r"[0-9a-f]{40}", commit) and vcs["git"].get("dirty", False) is False,
+             "Original source licence fallback requires an exact non-dirty reported VCS commit.")
+        path_in_vcs = vcs.get("path_in_vcs", "")
+        need(isinstance(path_in_vcs, str) and "\\" not in path_in_vcs and "\0" not in path_in_vcs
+             and not path_in_vcs.startswith("/") and not any(part in {"", ".", ".."} for part in path_in_vcs.split("/") if path_in_vcs),
+             "Original VCS package path is not canonical repository-relative POSIX text.")
+        parsed = urllib.parse.urlsplit(package.get("repository") or "")
+        parts = parsed.path.strip("/").split("/")
+        need(parsed.scheme == "https" and parsed.hostname == "github.com" and not parsed.username and not parsed.password
+             and parsed.port is None and not parsed.query and not parsed.fragment and len(parts) == 2,
+             "Original package repository must be an exact canonical public GitHub repository URL.")
+        owner, repository = parts
+        repository = repository[:-4] if repository.endswith(".git") else repository
+        need(re.fullmatch(r"[A-Za-z0-9_.-]+", owner) and re.fullmatch(r"[A-Za-z0-9_.-]+", repository)
+             and repository not in {".", ".."}, "Unsafe original GitHub repository identity.")
+        repo = owner + "/" + repository
+        if not hasattr(self, "license_api_cache"):
+            self.license_api_cache = {}
+        def get(suffix):
+            key = (repo, suffix)
+            if key in self.license_api_cache:
+                return self.license_api_cache[key]
+            connection = http.client.HTTPSConnection("api.github.com", timeout=30)
+            try:
+                headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10",
+                           "User-Agent": "official44-original-source-license-preflight", "Cache-Control": "no-cache"}
+                token = os.environ.get("LICENSE_GITHUB_TOKEN")
+                if token:
+                    headers["Authorization"] = "Bearer " + token
+                connection.request("GET", "/repos/" + repo + suffix + ("&" if "?" in suffix else "?") + "observed=" + uuid.uuid4().hex,
+                                   headers=headers)
+                response = connection.getresponse()
+                body = response.read(8 * 1024 * 1024 + 1)
+                need(response.status == 200 and len(body) <= 8 * 1024 * 1024, "Original public-source API read unconfirmed or exceeds bounded response gate.")
+                value = json.loads(body)
+                self.license_api_cache[key] = value
+                return value
+            finally:
+                connection.close()
+        metadata = get("")
+        need(metadata["private"] is False and metadata["full_name"].casefold() == repo.casefold(), "Refuse a private or mismatched original source repository.")
+        actual_commit = get("/git/commits/" + commit)
+        need(actual_commit["sha"] == commit and re.fullmatch(r"[0-9a-f]{40}", actual_commit["tree"]["sha"]), "Original source commit/tree binding mismatch.")
+        tree_sha = actual_commit["tree"]["sha"]
+        def tree(sha):
+            value = get("/git/trees/" + sha)
+            need(value["sha"] == sha and value.get("truncated") is False, "Unresolved or truncated exact original source tree.")
+            return value["tree"]
+        def blob(entry):
+            need(isinstance(entry["path"], str) and entry["path"] not in {"", ".", ".."}
+                 and not any(character in entry["path"] for character in ("/", "\\", "\0")),
+                 "Original nonrecursive tree leaf path is unsafe.")
+            need(entry["type"] == "blob" and entry["mode"] in {"100644", "100755"}
+                 and re.fullmatch(r"[0-9a-f]{40}", entry["sha"]), "Original licence/manifest must be an exact regular Git blob.")
+            value = get("/git/blobs/" + entry["sha"])
+            need(value["sha"] == entry["sha"] and value["encoding"] == "base64" and value["size"] <= 1024 * 1024,
+                 "Original text blob identity/encoding/size unconfirmed.")
+            content = base64.b64decode("".join(value["content"].splitlines()), validate=True)
+            need(len(content) == value["size"] and hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest() == entry["sha"],
+                 "Original text blob Git SHA/bytes do not match its exact tree entry.")
+            content.decode("utf-8")
+            return content
+        ancestors = [("", tree(tree_sha))]
+        for component in PurePosixPath(path_in_vcs).parts if path_in_vcs else ():
+            prefix, entries = ancestors[-1]
+            matches = [entry for entry in entries if entry["path"] == component]
+            need(len(matches) == 1 and matches[0]["type"] == "tree" and matches[0]["mode"] == "040000",
+                 "Original VCS path must walk exact directories, not links/gitlinks.")
+            ancestors.append(((prefix + "/" if prefix else "") + component, tree(matches[0]["sha"])))
+        manifest_entries = [entry for entry in ancestors[-1][1] if entry["path"] == "Cargo.toml"]
+        need(len(manifest_entries) == 1, "Original package manifest unresolved at exact VCS path.")
+        original_manifest = blob(manifest_entries[0])
+        authored_manifest = root / "Cargo.toml.orig"
+        need(authored_manifest.is_file() and authored_manifest.resolve(strict=True) == authored_manifest
+             and authored_manifest.read_bytes() == original_manifest, "Packaged authored manifest differs from exact original VCS manifest.")
+        original_package = tomllib.loads(original_manifest.decode())["package"]
+        need(original_package["name"] == package["name"], "Original VCS package name mismatch.")
+        for field in ("version", "license"):
+            expected = original_package.get(field)
+            if isinstance(expected, dict) and expected.get("workspace") is True:
+                inherited = []
+                for _, entries in reversed(ancestors):
+                    candidates = [entry for entry in entries if entry["path"] == "Cargo.toml"]
+                    if candidates:
+                        value = tomllib.loads(blob(candidates[0]).decode()).get("workspace", {}).get("package", {}).get(field)
+                        if value is not None:
+                            inherited.append(value)
+                            break
+                need(len(inherited) == 1, "Original workspace package identity/licence inheritance unresolved.")
+                expected = inherited[0]
+            need(expected == package.get(field), "Original package version/licence metadata mismatch.")
+        candidates = []
+        for prefix, entries in reversed(ancestors):
+            for entry in entries:
+                if re.search(r"(^|[-_.])(licen[cs]e|copying|notice)([-_.]|$)", entry["path"], re.I):
+                    need(entry["type"] == "blob" and entry["mode"] in {"100644", "100755"}, "Original ancestor notice is a link/nonregular object.")
+                    content = blob(entry)
+                    need(content.strip() and b"\0" not in content, "Original source licence text is empty or nontext.")
+                    relative = (prefix + "/" if prefix else "") + entry["path"]
+                    destination = self.root / "license-preflight-refs" / hashlib.sha256(package_id.encode()).hexdigest()[:20] / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if not destination.exists():
+                        destination.write_bytes(content)
+                    need(destination.read_bytes() == content, "Conflicting original source notice bytes.")
+                    candidates.append({"path": str(destination), "pin": pin(destination), "repo_relative_path": relative,
+                                       "url": "https://github.com/" + repo + "/blob/" + commit + "/" + urllib.parse.quote(relative, safe="/"),
+                                       "commit": commit, "tree": tree_sha, "blob": entry["sha"], "repository": repo,
+                                       "scope": "original_package_or_ancestor_notice_text"})
+        need(candidates, "No original licence text found at exact package/ancestor source paths.")
+        return {"package_id": package_id, "vcs": {"pin": pin(vcs_path), "commit": commit, "path_in_vcs": path_in_vcs},
+                "authored_manifest_pin": pin(authored_manifest), "original_manifest_blob": manifest_entries[0]["sha"],
+                "original_manifest_byte_identical": True, "whole_crate_source_equivalence_claimed": False, "notices": candidates}
+
+    def license_preflight_package(self, package_id, package, contract):
+        root = Path(package["manifest_path"]).parent
+        need(self.home in root.parents and root.resolve(strict=True) == root, "Preflight source must be the exact fetched external package.")
+        source_root = root
+        if package["source"].startswith("git+"):
+            candidates = [ancestor for ancestor in (root, *root.parents) if self.home in ancestor.parents and (ancestor / ".git").exists()]
+            need(candidates, "Fetched original external Git source root unresolved.")
+            source_root = candidates[0]
+        license_files = [path for path in files(source_root) if re.search(r"(^|[-_.])(licen[cs]e|copying|notice)([-_.]|$)", path.name, re.I)]
+        need(package.get("license") or package.get("license_file"), "Package licensing metadata unresolved.")
+        fallback = None
+        if package["name"] == "ct2rs":
+            need(package["version"] == "0.10.1", "Unreviewed ct2rs original licence contract version.")
+            vcs = json.loads((root / ".cargo_vcs_info.json").read_text())
+            need(vcs["git"]["sha1"] == "2d2bc51c5c3f10ba91ade120414c0fb4ed196051", "ct2rs original source notice contract mismatch.")
+            for notice in contract["licenses"]:
+                actual = pin(root / notice["crate_relative_path"]) if notice.get("crate_relative_path") else pin(Path(__file__).resolve().parent / notice["path"])
+                need(actual["bytes"] == notice["bytes"] and actual["sha256"] == notice["sha256"], "ct2rs original/vendor notice pin mismatch during preflight.")
+        elif not license_files:
+            fallback = self.original_license_fallback(package_id, package, root)
+        need(license_files or fallback or package["name"] == "ct2rs", "Original actual licence text remains unresolved.")
+        return {"source_root": str(source_root), "license_files": [str(path) for path in license_files], "fallback": fallback}
+
     def build(self):
         need(self.text("official-commit", ["git", "rev-parse", "HEAD"]) == OFFICIAL_COMMIT, "Official source commit mismatch.")
         need(self.text("official-tree", ["git", "rev-parse", "HEAD^{tree}"]) == OFFICIAL_TREE, "Official source tree mismatch.")
@@ -378,7 +542,7 @@ class Exporter:
             path = Path(__file__).resolve().parent / notice["path"]
             actual = pin(path)
             need(actual["bytes"] == notice["bytes"] and actual["sha256"] == notice["sha256"], "A staged exact public notice changed.")
-        metadata_raw = self.run("cargo-metadata", ["cargo", "metadata", "--locked", "--format-version", "1"]).read_text()
+        metadata_raw = self.run("cargo-metadata", ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", self.args.target]).read_text()
         metadata_values = [json.loads(line) for line in metadata_raw.splitlines() if line.startswith("{")]
         need(len(metadata_values) == 1, "Require one actual metadata document, separate from registry diagnostics.")
         meta = metadata_values[0]
@@ -389,10 +553,47 @@ class Exporter:
         by_name = {}
         for key, item in packages.items():
             by_name.setdefault(item["name"], []).append(key)
+        app_root, reachable = self.app_non_dev_closure(meta, packages)
+        preflight_ids = sorted(reachable.intersection(allowed))
+        license_infos = {}
+        for package_id in preflight_ids:
+            package = allowed[package_id]
+            try:
+                license_infos[package_id] = self.license_preflight_package(package_id, package, contract)
+            except Exception as error:
+                vcs_path = Path(package["manifest_path"]).parent / ".cargo_vcs_info.json"
+                vcs = None
+                if vcs_path.is_file():
+                    try:
+                        actual_vcs = json.loads(vcs_path.read_text())
+                        vcs = {"git": {key: actual_vcs.get("git", {}).get(key) for key in ("sha1", "dirty")},
+                               "path_in_vcs": actual_vcs.get("path_in_vcs"), "pin": pin(vcs_path)}
+                    except Exception as vcs_error:
+                        vcs = {"parse_error_type": type(vcs_error).__name__}
+                repository = urllib.parse.urlsplit(package.get("repository") or "")
+                safe_repository = package.get("repository") if not (repository.username or repository.password or repository.query or repository.fragment) else None
+                print(json.dumps({"phase": "license-preflight-unresolved", "package_id": package_id,
+                                  "name": package["name"], "version": package["version"], "source": package["source"],
+                                  "repository": safe_repository, "manifest_path": package["manifest_path"],
+                                  "vcs": vcs, "reason": str(error), "Cargo_build_started": False}, sort_keys=True), flush=True)
+                raise
+        print(json.dumps({"phase": "license-preflight-complete", "root_package_id": app_root, "target": self.args.target,
+                          "conservative_external_package_count": len(preflight_ids), "compiled_scope_claimed": False}, sort_keys=True), flush=True)
         raw = self.run("cargo-official-release", ["cargo", "build", "--locked", "--release", "-p", "omsi-app", "--bin", "openomsi",
                                                   "--target", self.args.target, "--message-format=json-render-diagnostics"])
         messages = [json.loads(line) for line in raw.read_text().splitlines() if line.startswith("{")]
         need(any(item.get("reason") == "build-finished" and item.get("success") is True for item in messages), "Natural build completion missing.")
+        actual_compiled_ids = {message["package_id"] for message in messages
+                               if message.get("reason") in {"compiler-artifact", "build-script-executed"} and message["package_id"] in allowed}
+        for package_id in sorted(actual_compiled_ids - license_infos.keys()):
+            try:
+                license_infos[package_id] = self.license_preflight_package(package_id, allowed[package_id], contract)
+            except Exception as error:
+                package = allowed[package_id]
+                print(json.dumps({"phase": "compiled-owner-license-unresolved", "package_id": package_id,
+                                  "name": package["name"], "version": package["version"], "source": package["source"],
+                                  "reason": str(error), "Cargo_build_started": True, "export_started": False}, sort_keys=True), flush=True)
+                raise
         native_plans = {}
         incomplete = set()
         for message in messages:
@@ -512,20 +713,27 @@ class Exporter:
             need(package.get("license") or package.get("license_file"), "Package licensing metadata is unresolved.")
             # Copy complete fetched package source, including bundled native
             # notices/corresponding source, not merely the crate SPDX string.
-            need(license_files or package["name"] == "ct2rs", "No actual license/notice text found for an exported package; manual resolution required.")
+            original_fallback = license_infos[package_id]["fallback"]
+            need(license_files or original_fallback or package["name"] == "ct2rs", "No actual license/notice text found for an exported package; manual resolution required.")
+            if original_fallback:
+                for notice in original_fallback["notices"]:
+                    actual = Path(notice["path"])
+                    need(pin(actual) == notice["pin"], "Original preflight notice bytes changed before compiled-source export.")
+                    self.copy(actual, "original-license-texts", package_id, self.root / "license-preflight-refs")
             self.tree(source_root, "cargo-home", package_id, self.home)
             source_rows.append({"package_id": package_id, "name": package["name"], "version": package["version"],
                                 "source": package["source"], "license": package.get("license"),
                                 "original_source_root": str(source_root),
                                 "license_files": [{"path": path.relative_to(source_root).as_posix(),
                                                    "sha256": pin(path)["sha256"]} for path in license_files],
+                                "original_source_license_fallback": original_fallback,
                                 "additional_workspace_license": ({"path": "public-licenses/ct2rs-0.10.1/WORKSPACE-LICENSE",
                                     "sha256": "ed39d4eb1b651d31041f1dde23f4fa4a19a7ab87ebfc6858b3abfd47f66cb557",
                                     "source_url": "https://raw.githubusercontent.com/jkawamoto/ctranslate2-rs/2d2bc51c5c3f10ba91ade120414c0fb4ed196051/LICENSE"}
                                     if package["name"] == "ct2rs" else None)})
         license_inventory = {"official_commit": OFFICIAL_COMMIT, "official_tree": OFFICIAL_TREE,
                              "cargo_lock_sha256": lock_before["sha256"],
-                             "packages": [{key: row[key] for key in ("package_id", "name", "version", "source", "license", "license_files", "additional_workspace_license")}
+                             "packages": [{key: row[key] for key in ("package_id", "name", "version", "source", "license", "license_files", "additional_workspace_license", "original_source_license_fallback")}
                                           for row in source_rows]}
         license_sha = hashlib.sha256(json.dumps(license_inventory, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         need(pin(self.official / "Cargo.lock") == lock_before
@@ -543,6 +751,10 @@ class Exporter:
                    "consumer_must_not_rewrite_fingerprints_or_force_workspace_freshness": True,
                    "license_inventory": license_inventory, "license_inventory_sha256": license_sha,
                    "source_license_contract_sha256": contract_pin["sha256"], "actual_external_native_builds": native_builds,
+                   "license_preflight": {"root_package_id": app_root, "target": self.args.target, "package_ids": preflight_ids,
+                                         "scope": "conservative_target_filtered_non_dev_reachable_not_compiled_scope"},
+                   "original_source_license_fallbacks": [license_infos[key]["fallback"] for key in sorted(compiled) if license_infos[key]["fallback"]],
+                   "non_cache_license_prefix": "original-license-texts/",
                    "native_cache_complete": not incomplete, "native_cache_incomplete_package_ids": sorted(incomplete),
                    "native_output_owners": native_owners, "non_cache_inspection_prefix": "inspection-native-output/",
                    "incomplete_package_target_artifacts_omitted": omitted_artifacts,
@@ -569,6 +781,10 @@ class Exporter:
                    "runtime_verified": False, "license_inventory_sha256": license_sha,
                    "license_inventory": license_inventory,
                    "source_license_contract_sha256": contract_pin["sha256"],
+                   "license_preflight": {"root_package_id": app_root, "target": self.args.target, "package_ids": preflight_ids,
+                                         "scope": "conservative_target_filtered_non_dev_reachable_not_compiled_scope"},
+                   "original_source_license_fallbacks": [license_infos[key]["fallback"] for key in sorted(compiled) if license_infos[key]["fallback"]],
+                   "non_cache_license_prefix": "original-license-texts/",
                    "native_cache_complete": not incomplete, "native_cache_incomplete_package_ids": sorted(incomplete),
                    "native_output_owners": native_owners, "non_cache_inspection_prefix": "inspection-native-output/",
                    "seed_scope": "partial_external_dependency_material_normal_Cargo_freshness_rules_apply",

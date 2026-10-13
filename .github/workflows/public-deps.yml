@@ -66,6 +66,7 @@ jobs:
           SEED_TARGET: ${{ matrix.target }}
           SEED_PUBLISH: ${{ inputs.publish_release_assets }}
           APPROVED_SOURCE_LICENSE_SHA: ${{ inputs.approved_source_license_contract_sha256 }}
+          LICENSE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 recipe/export_public_deps.py --official "$GITHUB_WORKSPACE/official" \
             --output "$RUNNER_TEMP/pst-public-deps-$SEED_ARCH" \

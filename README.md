@@ -45,6 +45,22 @@ Cargo-ready material. Its remaining safe native files are inspection-only under
 incomplete package IDs and normal rebuild requirements; it claims no complete
 standalone reusable native closure.
 
+License preflight runs before the expensive release build. Cargo metadata is
+filtered to the exact native target; traversal starts at the official `omsi-app`
+workspace identity and follows normal/build edges, excluding dev-only edges.
+This is a conservative preflight set, never an asserted compiled package set.
+A missing packaged text may be resolved only from the package's actual recorded
+VCS commit, canonical public GitHub repository and VCS package path. The original
+regular manifest blob must match `Cargo.toml.orig`; package version/license and
+workspace inheritance must match Cargo metadata. Original ancestor/root license
+blobs are bound by Git object SHA and content SHA256; no template text is inferred.
+An unresolved package stops before Cargo with its exact ID/name/version/source/VCS.
+Only actually compiled package IDs contribute fallback texts to the export.
+The ephemeral recipe token is used only for bounded GETs to the verified public
+original GitHub repositories, never forwarded to redirects or Cargo subprocesses.
+Original notice texts are data-only under `original-license-texts/`. VCS metadata
+is a locator and matching authored manifests do not claim whole-crate equivalence.
+
 The reviewed source-license contract pins the official Cargo.lock and the exact
 public ct2rs/CTranslate2/Ruy/cpuinfo notice texts. The actual export still requires
 every exported crate's complete source and actual license text, binds native build
