@@ -16,10 +16,10 @@
     "cpuinfo": "082deffc80ce517f81dc2f3aebe6ba671fcd09c9"
   },
   "official": {
-    "commit": "6c82e0771b0695c038c5278cb21894d2b9776c5a",
-    "tree": "977fdb2987349fb9fca0a87a43e17b77f83f2158",
-    "cargo_lock_bytes": 176274,
-    "cargo_lock_sha256": "0c5f7b13f20c89c8874611b5ae13663b0e7c093205b6a769b24b86cc36ebea73"
+    "commit": "8e9a6139ac7ba776325bd212864c3f37824b9cd3",
+    "tree": "ae44e5c40edc6c68008fb5b341efbf666f3c444f",
+    "cargo_lock_bytes": 175654,
+    "cargo_lock_sha256": "0e0a12bc376b74399759547c6665adc7eabbb9b10abb22c4c19c61f71c00b077"
   },
   "licenses": [
     {
@@ -50,5 +50,7 @@
       "source_url": "https://raw.githubusercontent.com/pytorch/cpuinfo/082deffc80ce517f81dc2f3aebe6ba671fcd09c9/LICENSE",
       "crate_relative_path": "CTranslate2/third_party/ruy/third_party/cpuinfo/LICENSE"
     }
-  ]
+  ],
+  "official_workspace_license": "MIT",
+  "target_filter_feature_metadata_recomputed_by_worker": true
 }

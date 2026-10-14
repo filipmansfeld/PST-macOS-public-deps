@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export an external dependency seed from official public 0.2.44 only.
+"""Export an external dependency seed from official public 0.2.50 only.
 
 This file is a standalone public recipe. It imports no private repository module,
 reads no credential store, and does not upload anything or execute the engine.
@@ -24,9 +24,9 @@ import tomllib
 import urllib.parse
 import uuid
 
-OFFICIAL_COMMIT = "6c82e0771b0695c038c5278cb21894d2b9776c5a"
-OFFICIAL_TREE = "977fdb2987349fb9fca0a87a43e17b77f83f2158"
-OFFICIAL_LOCK_SHA = "0c5f7b13f20c89c8874611b5ae13663b0e7c093205b6a769b24b86cc36ebea73"
+OFFICIAL_COMMIT = "8e9a6139ac7ba776325bd212864c3f37824b9cd3"
+OFFICIAL_TREE = "ae44e5c40edc6c68008fb5b341efbf666f3c444f"
+OFFICIAL_LOCK_SHA = "0e0a12bc376b74399759547c6665adc7eabbb9b10abb22c4c19c61f71c00b077"
 CARGO_VERSIONS = {"arm64": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
                   "x86_64": "cargo 1.98.0 (797e8a9bc 2026-08-05)"}
 RUST_RELEASES = {"arm64": "1.98.1", "x86_64": "1.98.0"}
@@ -431,7 +431,7 @@ class Exporter:
         for attempt in range(5):
             connection = http.client.HTTPSConnection(host, timeout=30)
             try:
-                headers = {"Accept": "application/json", "User-Agent": "official44-original-source-license-preflight", "Cache-Control": "no-cache"}
+                headers = {"Accept": "application/json", "User-Agent": "official50-original-source-license-preflight", "Cache-Control": "no-cache"}
                 if host == "api.github.com":
                     headers.update({"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10"})
                     token = os.environ.get("LICENSE_GITHUB_TOKEN")
@@ -1053,7 +1053,7 @@ class Exporter:
         license_sha = hashlib.sha256(json.dumps(license_inventory, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         need(pin(self.official / "Cargo.lock") == lock_before
              and not self.text("official-still-clean", ["git", "status", "--porcelain", "--untracked-files=no"]), "Official source changed.")
-        receipt = {"schema": "official44-external-macos-dependency-seed-v1", "status": "actual_external_dependency_export_completed",
+        receipt = {"schema": "official50-external-macos-dependency-seed-v1", "status": "actual_external_dependency_export_completed",
                    "official": {"commit": OFFICIAL_COMMIT, "tree": OFFICIAL_TREE, "cargo_lock": lock_before},
                    "toolchain": {"cargo": cargo, "rustc": rustc, "sdk": sdk, "clang": clang, "cmake": cmake, "os": os_info},
                    "architecture": self.args.architecture, "target": self.args.target, "profile_env": PROFILE,
@@ -1092,7 +1092,7 @@ class Exporter:
         need(pending.stat().st_size <= MAX_ARCHIVE, "Archive is not strictly below the public release 2GiB per-file limit.")
         pending.rename(archive)
         actual = pin(archive)
-        summary = {"schema": "official44-public-dependency-delivery-v1", "archive": actual, "archive_name": archive.name,
+        summary = {"schema": "official50-public-dependency-delivery-v1", "archive": actual, "archive_name": archive.name,
                    "official_commit": OFFICIAL_COMMIT, "official_tree": OFFICIAL_TREE,
                    "target": self.args.target, "profile_env": PROFILE, "toolchain": receipt["toolchain"],
                    "exported_file_count": len(self.inventory), "workspace_artifacts_exported": False,
@@ -1125,7 +1125,7 @@ def publish_release(args):
     """
     repo = "filipmansfeld/PST-macOS-public-deps"
     need(os.environ.get("GITHUB_REPOSITORY") == repo and re.fullmatch(r"[0-9a-f]{40}", args.recipe_commit)
-         and re.fullmatch(r"official44-deps-opt3-debug0-cgu32-lto-off-[a-z0-9-]+", args.release_tag)
+         and re.fullmatch(r"official50-deps-opt3-debug0-cgu32-lto-off-[a-z0-9-]+", args.release_tag)
          and args.release_id.isdecimal() and int(args.release_id) > 0, "Publication scope mismatch.")
     directory = Path(args.delivery).resolve(strict=True)
     name = "deps-" + args.architecture
@@ -1144,7 +1144,7 @@ def publish_release(args):
         connection = http.client.HTTPSConnection(host, timeout=180)
         try:
             headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
-                       "X-GitHub-Api-Version": "2026-03-10", "User-Agent": "official44-public-deps-recipe", "Cache-Control": "no-cache"}
+                       "X-GitHub-Api-Version": "2026-03-10", "User-Agent": "official50-public-deps-recipe", "Cache-Control": "no-cache"}
             if upload:
                 connection.putrequest(method, path)
                 for key, value in headers.items(): connection.putheader(key, value)
