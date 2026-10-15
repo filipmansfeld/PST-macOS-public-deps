@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export an external dependency seed from official public 0.2.50 only.
+"""Export an external dependency seed from official public 0.3.0 only.
 
 This file is a standalone public recipe. It imports no private repository module,
 reads no credential store, and does not upload anything or execute the engine.
@@ -24,8 +24,8 @@ import tomllib
 import urllib.parse
 import uuid
 
-OFFICIAL_COMMIT = "8e9a6139ac7ba776325bd212864c3f37824b9cd3"
-OFFICIAL_TREE = "ae44e5c40edc6c68008fb5b341efbf666f3c444f"
+OFFICIAL_COMMIT = "ab4d5df594de994ca86ff59a3ba29e63b5ef35d6"
+OFFICIAL_TREE = "1242bfaa61709d57890a467a4e83e2131f9c6367"
 OFFICIAL_LOCK_SHA = "0e0a12bc376b74399759547c6665adc7eabbb9b10abb22c4c19c61f71c00b077"
 CARGO_VERSIONS = {"arm64": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
                   "x86_64": "cargo 1.98.0 (797e8a9bc 2026-08-05)"}
@@ -431,7 +431,7 @@ class Exporter:
         for attempt in range(5):
             connection = http.client.HTTPSConnection(host, timeout=30)
             try:
-                headers = {"Accept": "application/json", "User-Agent": "official50-original-source-license-preflight", "Cache-Control": "no-cache"}
+                headers = {"Accept": "application/json", "User-Agent": "official030-original-source-license-preflight", "Cache-Control": "no-cache"}
                 if host == "api.github.com":
                     headers.update({"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10"})
                     token = os.environ.get("LICENSE_GITHUB_TOKEN")
@@ -792,6 +792,22 @@ class Exporter:
         contract = json.loads(contract_path.read_text())
         need(contract["official"]["commit"] == OFFICIAL_COMMIT and contract["official"]["tree"] == OFFICIAL_TREE
              and contract["official"]["cargo_lock_sha256"] == OFFICIAL_LOCK_SHA, "Public source/notice contract mismatch.")
+        source_inputs = contract.get("official_source_inputs", [])
+        need({row["path"] for row in source_inputs} == {"Cargo.toml", "crates/omsi-app/Cargo.toml", "LICENSE"},
+             "Exact reviewed official source/feature/licence input set missing.")
+        for row in source_inputs:
+            actual = pin(self.official / row["path"])
+            need(actual["bytes"] == row["bytes"] and actual["sha256"] == row["sha256"],
+                 "Official source/feature/licence input differs: " + row["path"])
+        workspace_license = tomllib.loads((self.official / "Cargo.toml").read_text())["workspace"]["package"]["license"]
+        need(workspace_license == contract["official_workspace_license"] == "AGPL-3.0-only",
+             "Official 0.3.0 workspace licence must not be relabelled.")
+        app_manifest = tomllib.loads((self.official / "crates/omsi-app/Cargo.toml").read_text())
+        allocators = [value["dependencies"]["mimalloc"] for value in app_manifest["target"].values()
+                      if "mimalloc" in value.get("dependencies", {})]
+        need(allocators == [contract["mimalloc_desktop_manifest"]]
+             and allocators[0] == {"version": "0.1.52", "default-features": False, "features": ["v2"]},
+             "Official desktop allocator v2 feature contract differs.")
         if self.args.publish_requested == "true":
             need(self.args.approved_source_license_contract == contract_pin["sha256"], "Publishing needs the reviewed exact source/notice contract pin.")
         for notice in contract["licenses"]:
@@ -809,8 +825,15 @@ class Exporter:
         by_name = {}
         for key, item in packages.items():
             by_name.setdefault(item["name"], []).append(key)
+        resolved_nodes = {node["id"]: node for node in meta["resolve"]["nodes"]}
+        allocator_ids = [key for key, item in allowed.items() if item["name"] == "mimalloc" and item["version"] == "0.1.52"]
+        need(len(allocator_ids) == 1 and "v2" in resolved_nodes[allocator_ids[0]]["features"],
+             "Target-filtered actual dependency metadata lacks the required mimalloc v2 feature.")
         app_root, reachable = self.app_non_dev_closure(meta, packages)
         preflight_ids = sorted(reachable.intersection(allowed))
+        target_filtered_features = [{"package_id": key, "name": packages[key]["name"],
+                                     "version": packages[key]["version"],
+                                     "features": sorted(resolved_nodes[key]["features"])} for key in preflight_ids]
         license_infos = {}
         unresolved_licenses = {}
         for package_id in preflight_ids:
@@ -1053,8 +1076,8 @@ class Exporter:
         license_sha = hashlib.sha256(json.dumps(license_inventory, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         need(pin(self.official / "Cargo.lock") == lock_before
              and not self.text("official-still-clean", ["git", "status", "--porcelain", "--untracked-files=no"]), "Official source changed.")
-        receipt = {"schema": "official50-external-macos-dependency-seed-v1", "status": "actual_external_dependency_export_completed",
-                   "official": {"commit": OFFICIAL_COMMIT, "tree": OFFICIAL_TREE, "cargo_lock": lock_before},
+        receipt = {"schema": "official030-external-macos-dependency-seed-v1", "status": "actual_external_dependency_export_completed",
+                   "official": {"commit": OFFICIAL_COMMIT, "tree": OFFICIAL_TREE, "cargo_lock": lock_before, "workspace_license": workspace_license},
                    "toolchain": {"cargo": cargo, "rustc": rustc, "sdk": sdk, "clang": clang, "cmake": cmake, "os": os_info},
                    "architecture": self.args.architecture, "target": self.args.target, "profile_env": PROFILE,
                    "canonical_origin": {"workspace": str(self.official), "cargo_home": str(self.home), "target": str(self.target)},
@@ -1065,6 +1088,8 @@ class Exporter:
                    "consumer_must_preserve_mtimes_and_check_source_toolchain_profile_paths": True,
                    "consumer_must_not_rewrite_fingerprints_or_force_workspace_freshness": True,
                    "license_inventory": license_inventory, "license_inventory_sha256": license_sha,
+                   "official_workspace_license": workspace_license, "official_source_inputs": source_inputs,
+                   "target_filtered_external_resolved_features": target_filtered_features,
                    "source_license_contract_sha256": contract_pin["sha256"], "actual_external_native_builds": native_builds,
                    "license_preflight": {"root_package_id": app_root, "target": self.args.target, "package_ids": preflight_ids,
                                          "scope": "conservative_target_filtered_non_dev_reachable_not_compiled_scope"},
@@ -1092,12 +1117,14 @@ class Exporter:
         need(pending.stat().st_size <= MAX_ARCHIVE, "Archive is not strictly below the public release 2GiB per-file limit.")
         pending.rename(archive)
         actual = pin(archive)
-        summary = {"schema": "official50-public-dependency-delivery-v1", "archive": actual, "archive_name": archive.name,
+        summary = {"schema": "official030-public-dependency-delivery-v1", "archive": actual, "archive_name": archive.name,
                    "official_commit": OFFICIAL_COMMIT, "official_tree": OFFICIAL_TREE,
                    "target": self.args.target, "profile_env": PROFILE, "toolchain": receipt["toolchain"],
                    "exported_file_count": len(self.inventory), "workspace_artifacts_exported": False,
                    "runtime_verified": False, "license_inventory_sha256": license_sha,
                    "license_inventory": license_inventory,
+                   "official_workspace_license": workspace_license, "official_source_inputs": source_inputs,
+                   "target_filtered_external_resolved_features": target_filtered_features,
                    "source_license_contract_sha256": contract_pin["sha256"],
                    "license_preflight": {"root_package_id": app_root, "target": self.args.target, "package_ids": preflight_ids,
                                          "scope": "conservative_target_filtered_non_dev_reachable_not_compiled_scope"},
@@ -1125,7 +1152,7 @@ def publish_release(args):
     """
     repo = "filipmansfeld/PST-macOS-public-deps"
     need(os.environ.get("GITHUB_REPOSITORY") == repo and re.fullmatch(r"[0-9a-f]{40}", args.recipe_commit)
-         and re.fullmatch(r"official50-deps-opt3-debug0-cgu32-lto-off-[a-z0-9-]+", args.release_tag)
+         and re.fullmatch(r"official030-deps-opt3-debug0-cgu32-lto-off-[a-z0-9-]+", args.release_tag)
          and args.release_id.isdecimal() and int(args.release_id) > 0, "Publication scope mismatch.")
     directory = Path(args.delivery).resolve(strict=True)
     name = "deps-" + args.architecture
@@ -1144,7 +1171,7 @@ def publish_release(args):
         connection = http.client.HTTPSConnection(host, timeout=180)
         try:
             headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
-                       "X-GitHub-Api-Version": "2026-03-10", "User-Agent": "official50-public-deps-recipe", "Cache-Control": "no-cache"}
+                       "X-GitHub-Api-Version": "2026-03-10", "User-Agent": "official030-public-deps-recipe", "Cache-Control": "no-cache"}
             if upload:
                 connection.putrequest(method, path)
                 for key, value in headers.items(): connection.putheader(key, value)

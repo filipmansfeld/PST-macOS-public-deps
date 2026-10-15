@@ -16,8 +16,8 @@
     "cpuinfo": "082deffc80ce517f81dc2f3aebe6ba671fcd09c9"
   },
   "official": {
-    "commit": "8e9a6139ac7ba776325bd212864c3f37824b9cd3",
-    "tree": "ae44e5c40edc6c68008fb5b341efbf666f3c444f",
+    "commit": "ab4d5df594de994ca86ff59a3ba29e63b5ef35d6",
+    "tree": "1242bfaa61709d57890a467a4e83e2131f9c6367",
     "cargo_lock_bytes": 175654,
     "cargo_lock_sha256": "0e0a12bc376b74399759547c6665adc7eabbb9b10abb22c4c19c61f71c00b077"
   },
@@ -51,6 +51,30 @@
       "crate_relative_path": "CTranslate2/third_party/ruy/third_party/cpuinfo/LICENSE"
     }
   ],
-  "official_workspace_license": "MIT",
-  "target_filter_feature_metadata_recomputed_by_worker": true
+  "official_workspace_license": "AGPL-3.0-only",
+  "target_filter_feature_metadata_recomputed_by_worker": true,
+  "official_source_inputs": [
+    {
+      "path": "Cargo.toml",
+      "bytes": 5052,
+      "sha256": "b3b86770ab3f65738dd98f5d809be536b7f89776d75a47a822821b87ddb87d8f"
+    },
+    {
+      "path": "crates/omsi-app/Cargo.toml",
+      "bytes": 6025,
+      "sha256": "a5a3bf3f9717708461c2830b07e4103cd216f2b1656e1bc414d51f62d8b8dc41"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 36558,
+      "sha256": "4cfc1a0e645c6506a80022ac1423d598e0a4a27d62ebd3d8d96b518278b74525"
+    }
+  ],
+  "mimalloc_desktop_manifest": {
+    "version": "0.1.52",
+    "default-features": false,
+    "features": [
+      "v2"
+    ]
+  }
 }

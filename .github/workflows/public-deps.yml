@@ -1,4 +1,4 @@
-name: Official 50 external Mac dependency seed
+name: Official 0.3.0 external Mac dependency seed
 on:
   workflow_dispatch:
     inputs:
@@ -34,7 +34,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: official50-public-dependency-seed-${{ inputs.existing_release_id }}-${{ inputs.architectures }}
+  group: official030-public-dependency-seed-${{ inputs.existing_release_id }}-${{ inputs.architectures }}
   cancel-in-progress: false
 jobs:
   seed:
@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: openOMSI-org/openOMSI
-          ref: 8e9a6139ac7ba776325bd212864c3f37824b9cd3
+          ref: ab4d5df594de994ca86ff59a3ba29e63b5ef35d6
           persist-credentials: false
           path: official
       - name: Build and export external dependencies only
